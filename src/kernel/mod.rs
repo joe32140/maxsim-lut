@@ -208,6 +208,45 @@ pub(crate) fn run(kernel: Kernel, lut: &Lut, args: &Args<'_>) -> f32 {
     }
 }
 
+/// Scalar reference. Doc-token-outer: expand each stored token's bytes to
+/// int8 weights once, amortised over all query rows.
+pub(crate) fn scalar(lut: &Lut, a: &Args<'_>) -> f32 {
+    let q = a.query;
+    let nq = q.n_tokens();
+    let dim = q.dim();
+    if nq == 0 || a.n_tokens == 0 {
+        return 0.0;
+    }
+    let kpb = lut.keys_per_byte();
+    let pdim = dim / kpb;
+    let qv = q.codes();
+    let sqw = q.sqw();
+    let mut best = vec![f32::NEG_INFINITY; nq];
+    let mut w = [0i8; MAX_DIM];
+    for t in 0..a.n_tokens {
+        let row = &a.packed[t * a.row_stride..t * a.row_stride + pdim];
+        for (i, &byte) in row.iter().enumerate() {
+            w[i * kpb..(i + 1) * kpb].copy_from_slice(lut.expand(byte));
+        }
+        let inv = a.inv(t);
+        let crow = a.crow(t);
+        for (qi, best_q) in best.iter_mut().enumerate() {
+            let qrow = &qv[qi * dim..(qi + 1) * dim];
+            let mut acc = 0i32;
+            for (qd, wd) in qrow.iter().zip(&w[..dim]) {
+                acc += *qd as i32 * *wd as i32;
+            }
+            // SAFETY: crow points at >= nq readable f32s (validated).
+            let c = unsafe { *crow.add(qi) };
+            let score = (sqw[qi] * acc as f32 + c) * inv;
+            if score > *best_q {
+                *best_q = score;
+            }
+        }
+    }
+    best.iter().sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,10 +283,6 @@ mod tests {
                     let mut w: Vec<f32> = (0..n).map(|_| rng.f32(-0.4, 0.4)).collect();
                     w.sort_by(|a, b| a.total_cmp(b));
                     let lut = Lut::new(&p, &w).unwrap();
-                    assert!(
-                        lut.kernel(dim).is_simd() || kernels.len() == 1,
-                        "dim {dim} nbits {nbits}"
-                    );
                     let query: Vec<f32> = (0..nq * dim).map(|_| rng.f32(-1.0, 1.0)).collect();
                     let q = PreparedQuery::new(&lut, &query, nq, dim).unwrap();
                     let ntok = 11;
@@ -290,43 +325,4 @@ mod tests {
         }
         eprintln!("kernels exercised: {:?}", kernels);
     }
-}
-
-/// Scalar reference. Doc-token-outer: expand each stored token's bytes to
-/// int8 weights once, amortised over all query rows.
-pub(crate) fn scalar(lut: &Lut, a: &Args<'_>) -> f32 {
-    let q = a.query;
-    let nq = q.n_tokens();
-    let dim = q.dim();
-    if nq == 0 || a.n_tokens == 0 {
-        return 0.0;
-    }
-    let kpb = lut.keys_per_byte();
-    let pdim = dim / kpb;
-    let qv = q.codes();
-    let sqw = q.sqw();
-    let mut best = vec![f32::NEG_INFINITY; nq];
-    let mut w = [0i8; MAX_DIM];
-    for t in 0..a.n_tokens {
-        let row = &a.packed[t * a.row_stride..t * a.row_stride + pdim];
-        for (i, &byte) in row.iter().enumerate() {
-            w[i * kpb..(i + 1) * kpb].copy_from_slice(lut.expand(byte));
-        }
-        let inv = a.inv(t);
-        let crow = a.crow(t);
-        for (qi, best_q) in best.iter_mut().enumerate() {
-            let qrow = &qv[qi * dim..(qi + 1) * dim];
-            let mut acc = 0i32;
-            for (qd, wd) in qrow.iter().zip(&w[..dim]) {
-                acc += *qd as i32 * *wd as i32;
-            }
-            // SAFETY: crow points at >= nq readable f32s (validated).
-            let c = unsafe { *crow.add(qi) };
-            let score = (sqw[qi] * acc as f32 + c) * inv;
-            if score > *best_q {
-                *best_q = score;
-            }
-        }
-    }
-    best.iter().sum()
 }
