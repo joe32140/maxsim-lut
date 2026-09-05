@@ -1,0 +1,7 @@
+maxsim-lut
+Copyright 2026 Chao-Chun Hsu
+
+This product includes software derived from next-plaid
+(https://github.com/lightonai/next-plaid), Copyright LightOn and contributors,
+licensed under the Apache License, Version 2.0. The asymmetric residual LUT
+kernels (src/kernel/*) originate in next-plaid's `residual_lut.rs`.

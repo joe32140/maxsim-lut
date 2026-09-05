@@ -1,0 +1,32 @@
+[package]
+name = "maxsim-lut"
+version = "0.1.0"
+edition = "2021"
+# 1.89 stabilised the AVX-512 intrinsics used by src/kernel/avx512.rs.
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "Asymmetric int8-query × fused-LUT MaxSim over packed residual codes (ColBERT/PLAID-style late interaction). SIMD inside, slices outside."
+repository = "https://github.com/joe32140/maxsim-lut"
+readme = "README.md"
+keywords = ["colbert", "maxsim", "late-interaction", "simd", "quantization"]
+categories = ["algorithms", "science"]
+exclude = [".github/"]
+
+[dependencies]
+# None. The crate is std-only on purpose: runtime CPU-feature detection needs
+# std, everything else is plain Rust.
+
+[dev-dependencies]
+# None either. Tests carry a 20-line xorshift generator instead of `rand`.
+
+[features]
+default = []
+
+[profile.release]
+debug = false
+
+[profile.bench]
+debug = true
+
+[[example]]
+name = "bench"
