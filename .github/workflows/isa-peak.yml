@@ -1,0 +1,35 @@
+name: isa-peak
+
+# Manual: measure each int8 dot instruction's sustained rate on every runner
+# class, next to the CPU model, so the per-architecture kernel defaults in
+# src/kernel/mod.rs can cite a number. Results are read from the job log.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  peak:
+    name: isa peak (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: identify the CPU
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            sysctl -n machdep.cpu.brand_string
+            sysctl hw.optional.arm | grep -E "FEAT_(DotProd|I8MM|SME)"
+          else
+            lscpu | grep -E "Model name|Vendor ID|^CPU\(s\)"
+            lscpu | grep -oE "(avx2|avx_vnni|avx512_vnni|avx512vl|asimddp|i8mm|sve2?)\b" | sort -u | tr '\n' ' '; echo
+          fi
+      - name: instruction peaks
+        run: cargo run --release --example isa_peak
+      - name: kernel bench for the same core
+        run: cargo run --release --example bench -- 128 4 32 240 256
