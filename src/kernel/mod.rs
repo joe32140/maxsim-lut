@@ -151,8 +151,38 @@ thread_local! {
 
 /// Runtime-dispatched MaxSim. `args` must come from `Scorer::validate`.
 pub(crate) fn maxsim(lut: &Lut, args: &Args<'_>) -> f32 {
-    let dim = args.query.dim();
-    match select(lut, dim) {
+    run(select(lut, args.query.dim()), lut, args)
+}
+
+/// Every kernel this CPU can execute, scalar first. Used by the tests so an
+/// AVX-512 machine still exercises the AVX2 path; `select` alone would skip it.
+#[cfg(test)]
+pub(crate) fn supported_kernels() -> Vec<Kernel> {
+    let mut v = vec![Kernel::Scalar(ScalarReason::Forced)];
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        v.push(Kernel::NeonSdot);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            v.push(Kernel::Avx2);
+        }
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni")
+        {
+            v.push(Kernel::Avx512Vnni);
+        }
+    }
+    v
+}
+
+/// Run a specific kernel. `kernel` must be executable on this CPU and, for
+/// the SIMD variants, `select` must not have returned a `Scalar` reason
+/// other than `Forced` for this `lut`/`dim` (i.e. dim aligned, tables present).
+pub(crate) fn run(kernel: Kernel, lut: &Lut, args: &Args<'_>) -> f32 {
+    match kernel {
         Kernel::Scalar(_) => scalar(lut, args),
         #[cfg(target_arch = "aarch64")]
         Kernel::NeonSdot => SCRATCH.with(|s| {
@@ -175,6 +205,90 @@ pub(crate) fn maxsim(lut: &Lut, args: &Args<'_>) -> f32 {
         }),
         #[allow(unreachable_patterns)]
         _ => scalar(lut, args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ColbertPacking;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn f32(&mut self, lo: f32, hi: f32) -> f32 {
+            lo + (hi - lo) * ((self.next() >> 40) as f32 / (1u64 << 24) as f32)
+        }
+    }
+
+    /// Every executable kernel agrees bitwise with the scalar reference. This
+    /// is the test that reaches AVX2 on an AVX-512 host and AVX-512 on any
+    /// host that has it; the integration tests only see whatever `select`
+    /// picks.
+    #[test]
+    fn every_supported_kernel_matches_scalar_bitwise() {
+        let kernels = supported_kernels();
+        let mut rng = Rng(0x452821E638D01377);
+        for &nq in &[1usize, 3, 7, 8, 9, 16, 17, 32] {
+            for &nbits in &[1usize, 2, 4] {
+                for &dim in &[8usize, 16, 40, 48, 96, 128, 200, 256] {
+                    let p = ColbertPacking::new(nbits).unwrap();
+                    let n = 1usize << nbits;
+                    let mut w: Vec<f32> = (0..n).map(|_| rng.f32(-0.4, 0.4)).collect();
+                    w.sort_by(|a, b| a.total_cmp(b));
+                    let lut = Lut::new(&p, &w).unwrap();
+                    assert!(
+                        lut.kernel(dim).is_simd() || kernels.len() == 1,
+                        "dim {dim} nbits {nbits}"
+                    );
+                    let query: Vec<f32> = (0..nq * dim).map(|_| rng.f32(-1.0, 1.0)).collect();
+                    let q = PreparedQuery::new(&lut, &query, nq, dim).unwrap();
+                    let ntok = 11;
+                    let pdim = dim / lut.keys_per_byte();
+                    let row_stride = pdim + 3;
+                    let packed: Vec<u8> = (0..ntok * row_stride).map(|_| (rng.next() >> 56) as u8).collect();
+                    let ncent = 5;
+                    let codes: Vec<u32> = (0..ntok).map(|_| (rng.next() % ncent as u64) as u32).collect();
+                    let cdot: Vec<f32> = (0..ncent * nq).map(|_| rng.f32(-1.0, 1.0)).collect();
+                    let inv: Vec<f32> = (0..ntok).map(|_| rng.f32(0.5, 1.5)).collect();
+                    for with_cdot in [false, true] {
+                        for with_inv in [false, true] {
+                            let args = Args {
+                                query: &q,
+                                packed: &packed,
+                                row_stride,
+                                n_tokens: ntok,
+                                codes: if with_cdot {
+                                    Codes::U32(&codes)
+                                } else {
+                                    Codes::None
+                                },
+                                cdot: if with_cdot { &cdot } else { q.zeros() },
+                                cdot_stride: if with_cdot { nq } else { 0 },
+                                inv_norms: if with_inv { Some(&inv) } else { None },
+                            };
+                            let want = scalar(&lut, &args);
+                            for &k in &kernels {
+                                let got = run(k, &lut, &args);
+                                assert_eq!(
+                                    got.to_bits(),
+                                    want.to_bits(),
+                                    "{k}: nq {nq} nbits {nbits} dim {dim} cdot {with_cdot} inv {with_inv}: {got} vs {want}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("kernels exercised: {:?}", kernels);
     }
 }
 

@@ -25,6 +25,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets
       - run: cargo test
+      - name: list the kernels the unit test exercised on this runner
+        run: cargo test --lib every_supported_kernel -- --nocapture 2>&1 | grep "kernels exercised"
       - name: test forced-scalar path
         run: cargo test
         env:
