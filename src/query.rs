@@ -21,9 +21,9 @@ pub struct PreparedQuery {
     /// (`d = i·keys_per_byte + k`), so the SIMD expand stores each `tbl`
     /// result contiguously. A dot product is permutation-invariant and the
     /// integer accumulator is order-invariant, so this changes no result.
-    /// The NEON kernel reads `planes` directly; the x86 kernels read the
-    /// derived `tiles`. Both are always built (cheap, a few KB) so the layout
-    /// stays tested on every target.
+    /// The NEON kernel reads `planes` directly; the other layouts below are
+    /// rearrangements of it, each built only on the architecture whose dot
+    /// instruction needs it.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     planes: Vec<i8>,
     #[cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86_64")), allow(dead_code))]
@@ -35,7 +35,7 @@ pub struct PreparedQuery {
     /// weight broadcast, so the accumulator lanes *are* the row sums and no
     /// horizontal reduction is needed. The +128 offset is exact: the kernel
     /// subtracts `128 · Σw` per token. Rows past `nq` hold 128 (code 0).
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    #[cfg(target_arch = "x86_64")]
     tiles: Vec<u8>,
     /// The same plane-order codes as *row pairs* for the `smmla` matrix
     /// instruction: `[⌈nq/2⌉ pairs][stride/8 groups][16 bytes]`, each 16-byte
@@ -43,7 +43,7 @@ pub struct PreparedQuery {
     /// same 8 dims of row `2p+1`. `smmla` multiplies such a 2×8 query block
     /// against a 2×8 block of two tokens' weights into a 2×2 accumulator.
     /// The odd row of an odd `nq` is all zeros.
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    #[cfg(target_arch = "aarch64")]
     pairs: Vec<i8>,
     /// Per row: `scales[q] · lut.scale`, the query-constant factor the fold
     /// applies to each integer accumulator.
@@ -101,24 +101,36 @@ impl PreparedQuery {
                 }
             }
         }
-        let d4n = stride / 4;
-        let n16 = nq.div_ceil(16);
-        let mut tiles = vec![128u8; n16 * d4n * 64];
-        for qi in 0..nq {
-            let (t, r) = (qi / 16, qi % 16);
-            for d in 0..dim {
-                let v = planes[qi * stride + d];
-                tiles[(t * d4n + d / 4) * 64 + r * 4 + (d % 4)] = (v as i16 + 128) as u8;
+        // Each alternative layout is a rearrangement of `planes` that one
+        // architecture's dot instruction needs, so it is built only where a
+        // kernel can consume it. Preparing a query is on the interactive
+        // latency path, and an aarch64 host has no use for GEMM tiles.
+        #[cfg(target_arch = "x86_64")]
+        let tiles = {
+            let d4n = stride / 4;
+            let n16 = nq.div_ceil(16);
+            let mut tiles = vec![128u8; n16 * d4n * 64];
+            for qi in 0..nq {
+                let (t, r) = (qi / 16, qi % 16);
+                for d in 0..dim {
+                    let v = planes[qi * stride + d];
+                    tiles[(t * d4n + d / 4) * 64 + r * 4 + (d % 4)] = (v as i16 + 128) as u8;
+                }
             }
-        }
-        let npairs = nq.div_ceil(2);
-        let mut pairs = vec![0i8; npairs * 2 * stride];
-        for qi in 0..nq {
-            let (p, r) = (qi / 2, qi % 2);
-            for d in 0..dim {
-                pairs[p * 2 * stride + (d / 8) * 16 + r * 8 + (d % 8)] = planes[qi * stride + d];
+            tiles
+        };
+        #[cfg(target_arch = "aarch64")]
+        let pairs = {
+            let npairs = nq.div_ceil(2);
+            let mut pairs = vec![0i8; npairs * 2 * stride];
+            for qi in 0..nq {
+                let (p, r) = (qi / 2, qi % 2);
+                for d in 0..dim {
+                    pairs[p * 2 * stride + (d / 8) * 16 + r * 8 + (d % 8)] = planes[qi * stride + d];
+                }
             }
-        }
+            pairs
+        };
         let sqw = scales.iter().map(|&s| s * lut.scale()).collect();
         Ok(Self {
             nq,
@@ -127,7 +139,9 @@ impl PreparedQuery {
             scales,
             planes,
             stride,
+            #[cfg(target_arch = "x86_64")]
             tiles,
+            #[cfg(target_arch = "aarch64")]
             pairs,
             sqw,
             zeros: vec![0.0f32; nq],
@@ -165,13 +179,13 @@ impl PreparedQuery {
     }
     /// Unsigned GEMM tiles; see the field docs. Tile `t` starts at
     /// `t · (stride/4) · 64`; dim group `g` of it at `+ g · 64`.
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn tiles_u8(&self) -> &[u8] {
         &self.tiles
     }
     /// Row-pair layout for `smmla`; see the field docs. Pair `p` starts at
     /// `p · 2 · stride`; dim group `g` (8 dims) of it at `+ g · 16`.
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn pairs(&self) -> &[i8] {
         &self.pairs
     }
@@ -206,7 +220,20 @@ mod tests {
         assert_eq!(p.planes()[..4], [64, 32, 0, 0]);
         assert_eq!(p.planes()[4..8], [-127, 0, 0, 0]);
         assert_eq!(p.stride(), 64);
-        // Tiles: one 16-row tile, 16 dim groups of 64 bytes. Group 0 row 0 =
+    }
+
+    /// The x86 tile layout. Built only where a kernel reads it, so this test
+    /// runs on the x86 CI runners; `row_pairs_*` is its aarch64 counterpart.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn gemm_tiles_place_every_row_and_dim() {
+        let lut = Lut::colbert(4, &[0.0; 16]).unwrap();
+        let dim = 8;
+        let q = vec![
+            0.5, -1.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        let p = PreparedQuery::new(&lut, &q, 2, dim).unwrap();
+        // One 16-row tile, 16 dim groups of 64 bytes. Group 0 row 0 =
         // planes[0..4] + 128; group 1 row 0 = planes[4..8] + 128; row 1 (zero
         // query) and the 14 padding rows are 128 everywhere.
         let t = p.tiles_u8();
@@ -223,14 +250,9 @@ mod tests {
                 assert_eq!(t[idx] as i16 - 128, p.planes()[qi * 64 + d] as i16);
             }
         }
-        // Row pairs: one pair of 2 · stride bytes; group 0 = row 0's first 8
-        // plane dims then row 1's (zero); every later group is zero padding.
-        let pr = p.pairs();
-        assert_eq!(pr.len(), 2 * 64);
-        assert_eq!(&pr[..8], &p.planes()[..8]);
-        assert!(pr[8..].iter().all(|&b| b == 0));
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn row_pairs_interleave_eight_dims_at_a_time() {
         let lut = Lut::colbert(4, &[0.0; 16]).unwrap();

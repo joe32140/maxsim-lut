@@ -170,21 +170,24 @@ impl<'a> Scorer<'a> {
     /// Score many documents into `out` (`out.len()` must equal the number of
     /// documents). Sequential; wrap the call in the host's parallel iterator
     /// over chunks to fan out.
+    ///
+    /// Panics if the counts disagree in either direction. Silently dropping
+    /// the tail of a candidate list is the kind of bug that shows up as a
+    /// slightly worse recall number months later, not as a failure.
     pub fn score_many<'d, I>(&self, docs: I, out: &mut [f32])
     where
         I: IntoIterator<Item = DocView<'d>>,
     {
+        let slots = out.len();
         let mut n = 0usize;
-        for (slot, doc) in out.iter_mut().zip(docs) {
+        for doc in docs {
+            let slot = out
+                .get_mut(n)
+                .unwrap_or_else(|| panic!("score_many: more than {slots} documents"));
             *slot = self.score(doc);
             n += 1;
         }
-        assert_eq!(
-            n,
-            out.len(),
-            "score_many: {n} documents for {} output slots",
-            out.len()
-        );
+        assert_eq!(n, slots, "score_many: {n} documents for {slots} output slots");
     }
 
     fn validate<'d>(&self, doc: DocView<'d>) -> Result<Args<'d>, Error>

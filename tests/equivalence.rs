@@ -528,4 +528,26 @@ fn score_many_matches_score() {
             s.score(DocView::new(&d.packed, d.ntok, d.stride)).to_bits()
         );
     }
+
+    // A miscount must be loud in *both* directions. Scoring only as many
+    // candidates as there are slots, and reporting success, is the kind of
+    // bug that surfaces as a slightly worse recall number months later.
+    let views = || docs.iter().map(|d| DocView::new(&d.packed, d.ntok, d.stride));
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {})); // both panics below are expected
+    let caught: Vec<bool> = [docs.len() - 1, docs.len() + 1]
+        .iter()
+        .map(|&slots| {
+            let mut out = vec![0.0f32; slots];
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.score_many(views(), &mut out)))
+                .is_err()
+        })
+        .collect();
+    std::panic::set_hook(hook);
+    assert_eq!(
+        caught,
+        [true, true],
+        "score_many accepted a miscount of {} documents",
+        docs.len()
+    );
 }

@@ -27,6 +27,3 @@ debug = false
 
 [profile.bench]
 debug = true
-
-[[example]]
-name = "bench"

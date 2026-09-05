@@ -36,7 +36,12 @@ pub trait Packing {
             // this is a reference path, so brute force is fine.
             let byte = (0..=255u8)
                 .find(|&b| (0..kpb).all(|k| self.bucket_index(b, k) == chunk[k]))
-                .expect("Packing::bucket_index must be a bijection over bytes");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no byte encodes buckets {chunk:?}: each must be < 2^nbits, and \
+                         Packing::bucket_index must be a bijection over bytes"
+                    )
+                });
             out[i] = byte;
         }
     }
