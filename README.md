@@ -45,10 +45,12 @@ is the int8 query quantisation, unchanged by anything here.
 
 The end-to-end figure is bounded by whatever else your query does — here stage
 2 falls from 74% of the query to 42% of it — and by how deep your candidate
-list is (a sweep is in [real data](#real-data)). Both versions ran with
-identical search parameters; next-plaid's own published figure for 1.6.5 → 1.7.0
-is higher (4.3–5.4×), measured on a different checkpoint and with each version's
-parameters tuned to matched quality rather than held equal.
+list is (a sweep is in [real data](#real-data)). The 3.47× for 1.6.5 → 1.7.0 is
+that release's own figure at *this* working point; sweeping the candidate depth
+it ranges 3.5–5.0×, which brackets next-plaid's published 4.3–5.4×. Part of that
+spread is not kernel speed at all: 1.6.5 dispatched rescoring in fixed 128-document
+chunks, so at shallow depths it ran on one or two threads and looks worse than its
+arithmetic deserves.
 
 ## Install
 
@@ -362,12 +364,23 @@ At shallow depths stage 1 dominates and no stage-2 kernel can help you; the
 gain arrives as the rescore list grows. Measure your own split before assuming
 this is your bottleneck.
 
-The 1.6.5 column is deliberately absent here. Its rescore loop dispatched 128
-documents per task, so 64 and 128 candidates both ran on a single thread and
-256 on two — its depth curve is a picture of thread utilisation rather than of
-per-candidate cost, and putting it beside the others would compare the wrong
-thing. At the default depth, where that effect is smallest, it is the 19.26 ms
-in the table at the top.
+The 1.6.5 column is deliberately absent here, because its stage 2 is not
+measuring what the other two are. It dispatched rescoring in fixed 128-document
+chunks (`par_chunks(DECOMPRESS_CHUNK_SIZE)`), so its per-document cost is a
+picture of how many chunks the pool got rather than of arithmetic:
+
+| candidates | chunks | 1.6.5 µs/doc | 1.7.0 | with this crate |
+|---|---|---|---|---|
+| 64 | 1 | 63.0 | 5.4 | 2.8 |
+| 128 | 1 | 64.0 | 4.4 | 2.1 |
+| 256 | 2 | 32.5 | 3.6 | 1.8 |
+| 512 | 4 | 17.4 | 3.4 | 1.8 |
+| 1024 | 8 | 14.1 | 3.2 | 1.5 |
+
+64 and 128 candidates cost the same per document because both are one chunk on
+one thread; the figure then halves as the chunk count doubles, and stops
+improving at 8 chunks on a 10-core machine. Per-document cost is flat for the
+other two arms, which is what a cost curve should look like.
 
 ## Provenance and license
 
