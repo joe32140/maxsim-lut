@@ -372,6 +372,24 @@ pub fn supported_kernels() -> &'static [Kernel] {
     cpu_kernels()
 }
 
+/// Run the kernel calibration now and return the kernel it chose.
+///
+/// Calibration otherwise happens inside the first [`crate::Scorer::score`]
+/// of the process, which charges one query a few hundred microseconds it did
+/// not expect. A server can call this at startup instead, so the cost lands
+/// before the first request rather than inside it. Calling it more than
+/// once, or from several threads, is harmless: the decision is made once.
+///
+/// The returned kernel is what dispatch will pick *absent* an override; a
+/// [`crate::Lut`] with [`crate::Lut::force_scalar`] or
+/// [`crate::Lut::pin_kernel`] set, a non-SIMD `dim`, or a table with no
+/// nibble factorisation still routes elsewhere. Ask
+/// [`crate::Lut::kernel`] for the decision that applies to a specific table
+/// and dimension.
+pub fn warm_up() -> Kernel {
+    calibrated()
+}
+
 /// Everything a kernel needs, already validated by [`crate::Scorer`].
 pub(crate) struct Args<'a> {
     pub query: &'a PreparedQuery,

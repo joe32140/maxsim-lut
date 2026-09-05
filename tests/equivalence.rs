@@ -110,6 +110,14 @@ fn reference(
     total
 }
 
+/// Whether dispatch is free to pick a SIMD kernel here: this CPU has one and
+/// nothing in the environment (`MAXSIM_LUT_FORCE_SCALAR`) is overriding it.
+/// Tests that assert *which* kernel runs have to ask, because CI runs the
+/// whole suite a second time with that variable set.
+fn dispatch_is_free() -> bool {
+    Lut::colbert(4, &[0.0; 16]).unwrap().kernel(128).is_simd()
+}
+
 #[test]
 fn simd_matches_scalar_bitwise_across_shapes() {
     // Three independent draws per shape; one is a single arrangement of
@@ -236,6 +244,96 @@ fn pinned_kernels_agree_with_the_calibrated_default() {
         );
         assert_eq!(score(&both).to_bits(), want.to_bits());
     }
+}
+
+/// Randomised shapes rather than a fixed grid: the hand-picked sweep covers
+/// the boundaries someone thought of, which is exactly the set a bug in the
+/// tails is least likely to sit in. Every draw varies the code width, the
+/// dimension (byte-aligned but often not SIMD-aligned, so the scalar
+/// fallback is exercised too), the query row count, the token count and the
+/// row padding, and every one must reproduce the reference bit for bit.
+#[test]
+fn randomised_shapes_match_the_scalar_reference() {
+    let mut rng = Rng(0x9E3779B97F4A7C15);
+    let (mut simd_cases, mut scalar_cases) = (0usize, 0usize);
+    for case in 0..250 {
+        let nbits = [1usize, 2, 4][rng.below(3)];
+        let kpb = 8 / nbits;
+        // dim: byte-aligned for this width, up to MAX_DIM, deliberately not
+        // always a multiple of 8.
+        let dim = kpb * (1 + rng.below(maxsim_lut::MAX_DIM / kpb));
+        let nq = 1 + rng.below(40);
+        let ntok = 1 + rng.below(20);
+        let extra = rng.below(4);
+        let ncent = 1 + rng.below(6);
+
+        let p = ColbertPacking::new(nbits).unwrap();
+        let w = weights(nbits, &mut rng);
+        let lut = Lut::new(&p, &w).unwrap();
+        let lut_scalar = lut.clone().force_scalar(true);
+        let query: Vec<f32> = (0..nq * dim).map(|_| rng.f32(-1.0, 1.0)).collect();
+        let q = PreparedQuery::new(&lut, &query, nq, dim).unwrap();
+        let cdot: Vec<f32> = (0..ncent * nq).map(|_| rng.f32(-1.0, 1.0)).collect();
+        let doc = make_doc(&p, dim, ntok, ncent, extra, &mut rng);
+        let view = DocView::new(&doc.packed, doc.ntok, doc.stride)
+            .codes(Codes::U32(&doc.codes))
+            .inv_norms(&doc.inv);
+
+        let fast = Scorer::new(&lut, &q)
+            .with_centroid_term(&cdot, ncent)
+            .unwrap()
+            .score(view);
+        let slow = Scorer::new(&lut_scalar, &q)
+            .with_centroid_term(&cdot, ncent)
+            .unwrap()
+            .score(view);
+        assert_eq!(
+            fast.to_bits(),
+            slow.to_bits(),
+            "case {case}: nbits={nbits} dim={dim} nq={nq} ntok={ntok} extra={extra} on {}: {fast} vs {slow}",
+            lut.kernel(dim)
+        );
+        let want = reference(&lut, &q, &w, &doc, Some((&cdot, ncent)), true);
+        assert!(
+            (fast as f64 - want).abs() < 1e-3 * (1.0 + want.abs()),
+            "case {case}: nbits={nbits} dim={dim} nq={nq}: {fast} vs f64 reference {want}"
+        );
+        if lut.kernel(dim).is_simd() {
+            simd_cases += 1;
+        } else {
+            scalar_cases += 1;
+        }
+    }
+    // A randomised test that stopped covering both paths would still pass
+    // while proving much less, so make the mix itself an assertion.
+    assert!(scalar_cases > 0, "no case landed on the scalar fallback");
+    if dispatch_is_free() {
+        assert!(
+            simd_cases > 20,
+            "only {simd_cases} of 250 cases reached a SIMD kernel"
+        );
+    }
+}
+
+/// `warm_up` resolves the same decision dispatch would reach, and repeating
+/// it cannot change the answer.
+#[test]
+fn warm_up_agrees_with_dispatch() {
+    let k = maxsim_lut::warm_up();
+    assert_eq!(k, maxsim_lut::warm_up(), "warm_up is not idempotent");
+    let lut = Lut::colbert(4, &(0..16).map(|i| i as f32 * 0.04 - 0.3).collect::<Vec<_>>()).unwrap();
+    // Absent an override, a SIMD-eligible shape dispatches to exactly it.
+    // `warm_up` reports the *calibrated* choice, which both overrides outrank:
+    // `MAXSIM_LUT_FORCE_SCALAR` sends dispatch to the reference path and
+    // `MAXSIM_LUT_KERNEL` pins a different kernel. CI runs the suite under
+    // both, so compare only when neither is in play.
+    let pinned = std::env::var("MAXSIM_LUT_KERNEL").is_ok();
+    if dispatch_is_free() && !pinned {
+        assert_eq!(lut.kernel(128), k);
+    }
+    // Overrides still win over the warmed choice.
+    assert!(!lut.clone().force_scalar(true).kernel(128).is_simd());
+    assert!(!lut.kernel(129).is_simd(), "dim 129 is not SIMD eligible");
 }
 
 #[test]

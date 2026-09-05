@@ -145,6 +145,10 @@ machine has must prove itself on the host before dispatch will use it; if
 none verifies, scoring falls back to the reference path and
 `Lut::kernel(dim)` reports `scalar (SelfCheckFailed)`.
 
+Calibration runs inside the first `score` of the process. A server that
+would rather not charge one query for it calls `maxsim_lut::warm_up()` at
+startup, which makes the decision then and returns the chosen kernel.
+
 Override it when you need to:
 
 ```rust
@@ -155,6 +159,14 @@ MAXSIM_LUT_KERNEL=neon-i8mm     # pin by name
 MAXSIM_LUT_NO_CALIBRATE=1       # take the first listed kernel, skip measuring
 MAXSIM_LUT_FORCE_SCALAR=1       # the reference path
 ```
+
+Highest precedence first: `MAXSIM_LUT_FORCE_SCALAR`, then the shape checks that
+rule SIMD out entirely (`dim % 8`, `MAX_DIM`, no nibble tables), then
+`pin_kernel`, then `MAXSIM_LUT_KERNEL`, then calibration (which
+`MAXSIM_LUT_NO_CALIBRATE` reduces to "take the widest"). Either pin is ignored
+when it names a kernel this CPU cannot execute. `warm_up()` reports the *calibrated*
+choice, so it can differ from `Lut::kernel(dim)` when a pin or the forced-scalar
+switch is in play.
 
 ## How much faster than the first version
 
@@ -207,6 +219,13 @@ independent random draws each), and the integration test
 `pinned_kernels_agree_with_the_calibrated_default` through the public pinning
 API. So an AVX-512 machine still verifies AVX2, and a Neoverse core verifies
 both NEON kernels.
+
+`randomised_shapes_match_the_scalar_reference` then draws 250 shapes at
+random rather than from a grid, varying code width, dimension, query rows,
+token count and row padding together, and asserts that the mix actually
+reached both a SIMD kernel and the scalar fallback. A hand-picked sweep
+covers the boundaries someone thought of, which is the set a bug in the
+tails is least likely to occupy.
 
 `tests/concurrency.rs` is a separate binary, so its threads race for the
 first dispatch in a cold process: it checks that concurrent scoring is
