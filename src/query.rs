@@ -21,12 +21,22 @@ pub struct PreparedQuery {
     /// (`d = i·keys_per_byte + k`), so the SIMD expand stores each `tbl`
     /// result contiguously. A dot product is permutation-invariant and the
     /// integer accumulator is order-invariant, so this changes no result.
-    /// Only the SIMD kernels read these; on targets without one they are
-    /// still built (cheap, `nq · 64..256` bytes) so the layout stays tested.
-    #[cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86_64")), allow(dead_code))]
+    /// The NEON kernel reads `planes` directly; the x86 kernels read the
+    /// derived `tiles`. Both are always built (cheap, a few KB) so the layout
+    /// stays tested on every target.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     planes: Vec<i8>,
     #[cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86_64")), allow(dead_code))]
     stride: usize,
+    /// The same plane-order codes as *unsigned* GEMM tiles for the
+    /// `u8 × s8` dot instructions (`vpdpbusd`): `[⌈nq/16⌉ tiles][stride/4
+    /// groups][16 rows][4 bytes]`, each byte `code + 128`. A 64-byte load is
+    /// then 16 rows × 4 consecutive plane dims, multiplied against a 4-byte
+    /// weight broadcast, so the accumulator lanes *are* the row sums and no
+    /// horizontal reduction is needed. The +128 offset is exact: the kernel
+    /// subtracts `128 · Σw` per token. Rows past `nq` hold 128 (code 0).
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    tiles: Vec<u8>,
     /// Per row: `scales[q] · lut.scale`, the query-constant factor the fold
     /// applies to each integer accumulator.
     sqw: Vec<f32>,
@@ -83,6 +93,16 @@ impl PreparedQuery {
                 }
             }
         }
+        let d4n = stride / 4;
+        let n16 = nq.div_ceil(16);
+        let mut tiles = vec![128u8; n16 * d4n * 64];
+        for qi in 0..nq {
+            let (t, r) = (qi / 16, qi % 16);
+            for d in 0..dim {
+                let v = planes[qi * stride + d];
+                tiles[(t * d4n + d / 4) * 64 + r * 4 + (d % 4)] = (v as i16 + 128) as u8;
+            }
+        }
         let sqw = scales.iter().map(|&s| s * lut.scale()).collect();
         Ok(Self {
             nq,
@@ -91,6 +111,7 @@ impl PreparedQuery {
             scales,
             planes,
             stride,
+            tiles,
             sqw,
             zeros: vec![0.0f32; nq],
             lut_fingerprint: lut.fingerprint(),
@@ -117,13 +138,19 @@ impl PreparedQuery {
         &self.scales
     }
 
-    #[cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn planes(&self) -> &[i8] {
         &self.planes
     }
     #[cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn stride(&self) -> usize {
         self.stride
+    }
+    /// Unsigned GEMM tiles; see the field docs. Tile `t` starts at
+    /// `t · (stride/4) · 64`; dim group `g` of it at `+ g · 64`.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn tiles_u8(&self) -> &[u8] {
+        &self.tiles
     }
     pub(crate) fn sqw(&self) -> &[f32] {
         &self.sqw
@@ -156,6 +183,23 @@ mod tests {
         assert_eq!(p.planes()[..4], [64, 32, 0, 0]);
         assert_eq!(p.planes()[4..8], [-127, 0, 0, 0]);
         assert_eq!(p.stride(), 64);
+        // Tiles: one 16-row tile, 16 dim groups of 64 bytes. Group 0 row 0 =
+        // planes[0..4] + 128; group 1 row 0 = planes[4..8] + 128; row 1 (zero
+        // query) and the 14 padding rows are 128 everywhere.
+        let t = p.tiles_u8();
+        assert_eq!(t.len(), 16 * 64);
+        assert_eq!(&t[0..4], &[192, 160, 128, 128]);
+        assert!(t[4..64].iter().all(|&b| b == 128));
+        assert_eq!(&t[64..68], &[1, 128, 128, 128]);
+        assert!(t[68..].iter().all(|&b| b == 128));
+        // Exhaustive: every (row, dim) lands where the kernel will read it.
+        for qi in 0..2 {
+            for d in 0..dim {
+                let (tile, r) = (qi / 16, qi % 16);
+                let idx = (tile * 16 + d / 4) * 64 + r * 4 + d % 4;
+                assert_eq!(t[idx] as i16 - 128, p.planes()[qi * 64 + d] as i16);
+            }
+        }
     }
 
     #[test]

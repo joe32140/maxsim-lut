@@ -74,6 +74,44 @@ fn env_force_scalar() -> bool {
     })
 }
 
+/// `MAXSIM_LUT_KERNEL=<name>` pins a SIMD kernel by its `Display` name
+/// (`neon-sdot`, `avx2`, `avx512-vnni`), for benchmarking a path the CPU
+/// would not dispatch to by default (e.g. AVX2 on an AVX-512 machine). It is
+/// honoured only when the CPU supports that kernel and the shape is SIMD
+/// eligible; otherwise dispatch proceeds normally. Read once per process.
+fn env_pin() -> Option<Kernel> {
+    static PIN: OnceLock<Option<Kernel>> = OnceLock::new();
+    *PIN.get_or_init(|| match std::env::var("MAXSIM_LUT_KERNEL").ok()?.as_str() {
+        "neon-sdot" => Some(Kernel::NeonSdot),
+        "avx2" => Some(Kernel::Avx2),
+        "avx512-vnni" => Some(Kernel::Avx512Vnni),
+        _ => None,
+    })
+}
+
+/// What the CPU can execute, best first (`None` if nothing SIMD).
+fn cpu_kernels() -> &'static [Kernel] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return &[Kernel::NeonSdot];
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let avx512 = is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni");
+        if avx512 {
+            return &[Kernel::Avx512Vnni, Kernel::Avx2];
+        }
+        if is_x86_feature_detected!("avx2") {
+            return &[Kernel::Avx2];
+        }
+    }
+    &[]
+}
+
 /// The dispatch decision, in one place, so [`Lut::kernel`] and
 /// [`maxsim`] cannot disagree.
 pub(crate) fn select(lut: &Lut, dim: usize) -> Kernel {
@@ -86,25 +124,15 @@ pub(crate) fn select(lut: &Lut, dim: usize) -> Kernel {
     if lut.nibble_tables().is_none() {
         return Kernel::Scalar(ScalarReason::NoNibbleTables);
     }
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::arch::is_aarch64_feature_detected!("dotprod") {
-            return Kernel::NeonSdot;
+    let cpu = cpu_kernels();
+    if let Some(pin) = env_pin() {
+        if cpu.contains(&pin) {
+            return pin;
         }
     }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-        {
-            return Kernel::Avx512Vnni;
-        }
-        if is_x86_feature_detected!("avx2") {
-            return Kernel::Avx2;
-        }
-    }
-    Kernel::Scalar(ScalarReason::CpuUnsupported)
+    cpu.first()
+        .copied()
+        .unwrap_or(Kernel::Scalar(ScalarReason::CpuUnsupported))
 }
 
 /// Everything a kernel needs, already validated by [`crate::Scorer`].
@@ -159,22 +187,7 @@ pub(crate) fn maxsim(lut: &Lut, args: &Args<'_>) -> f32 {
 #[cfg(test)]
 pub(crate) fn supported_kernels() -> Vec<Kernel> {
     let mut v = vec![Kernel::Scalar(ScalarReason::Forced)];
-    #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("dotprod") {
-        v.push(Kernel::NeonSdot);
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") {
-            v.push(Kernel::Avx2);
-        }
-        if is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-        {
-            v.push(Kernel::Avx512Vnni);
-        }
-    }
+    v.extend_from_slice(cpu_kernels());
     v
 }
 
