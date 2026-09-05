@@ -20,7 +20,40 @@ Which of an architecture's kernels runs is decided by measuring them on the
 host core, not by feature bits (see [per-architecture
 specialisation](#per-architecture-specialisation)).
 
+## What it buys a real engine
+
+Wired into [next-plaid](https://github.com/lightonai/next-plaid) 1.7.0 and run
+on SciFact (5,183 docs, 1.25M tokens, ColBERTv2, dim 128, nbits 4) with 50 real
+queries at that release's default search parameters, on an Apple M4:
+
+| stage-2 route | stage 2 | end-to-end | vs float |
+|---|---|---|---|
+| decompress to f32, then MaxSim (what next-plaid ≤1.6.5 did) | 12.03 ms | 14.13 ms | 1.00× |
+| the LUT kernel this crate started from (next-plaid 1.7.0) | 3.29 ms | 5.61 ms | 2.52× |
+| **this crate** | **1.63 ms** | **3.87 ms** | **3.65×** |
+
+Same documents, same ranking: the two asymmetric rows are bit-identical to each
+other, and both differ from full decompression on 3 of 50 top-10 lists — that
+is the int8 query quantisation, unchanged by anything here.
+
+So: **7.4× on stage 2 and 3.65× end-to-end** against a float-decompression
+rescorer, or **2.0× and 1.45×** if your engine already has the unblocked LUT
+kernel. The end-to-end figure is bounded by whatever else your query does —
+here stage 2 falls from 85% of the query to 42% of it, and how much you gain
+depends on your candidate depth (a sweep is in [real data](#real-data)).
+
+## Install
+
+```
+cargo add maxsim-lut
+```
+
+No dependencies, and none are added to your tree. MSRV 1.89.
+
 ## Use
+
+The doc example on [docs.rs](https://docs.rs/maxsim-lut) compiles and runs as
+written; this is the same shape with the host's real names.
 
 ```rust
 use maxsim_lut::{Codes, DocView, Lut, PreparedQuery, Scorer};
@@ -74,6 +107,11 @@ all 256 byte values at `Lut::new`; a layout they cannot express falls back
 to the scalar path rather than diverging from it.
 
 ## Numbers
+
+The `Nx scalar` column below is against this crate's *own* scalar reference,
+which already uses the fused table — it is a kernel-vs-kernel figure for
+tuning, not the host-visible speedup. For that, see [what it buys a real
+engine](#what-it-buys-a-real-engine).
 
 `cargo run --release --example bench` times **every kernel this CPU can run**,
 plus the scalar reference, interleaved round by round in one process, and
@@ -291,6 +329,32 @@ tokens, nbits 4) on an M4: 31.9 ns/token on real codes (same as synthetic),
 max |Δscore| 0.0086 with mean relative error 1.5e-4 from the int8 query
 quantisation, and the exact skip bound never fires (mean bound 0.70 against a
 mean residual term of 0.039), so exact token skipping is not a lever here.
+
+### Inside a real engine
+
+The table at the top comes from actually wiring this crate into next-plaid
+1.7.0 behind its `Packing` trait, so both routes read the same mmap index and
+the only difference is the kernel. All three arms run in one process,
+alternating, because two process starts on a hybrid CPU can land on different
+core types and invert a result (noise came out at 0.6–1.0%).
+
+How much you gain end-to-end depends on how many candidates you rescore, since
+stage 1 does not shrink. On this index, with `n_full_scores/4` documents
+rescored:
+
+| candidates rescored | ≤1.6.5 float | 1.7.0 LUT | this crate | vs float |
+|---|---|---|---|---|
+| 64 | 2.71 ms | 2.40 | 2.22 | 1.22× |
+| 128 | 3.45 | 2.64 | 2.35 | 1.47× |
+| 256 | 4.91 | 3.07 | 2.57 | 1.91× |
+| 512 | 7.77 | 3.91 | 3.03 | 2.56× |
+| 1024 (1.7.0 default) | 13.57 | 5.58 | 3.84 | 3.54× |
+
+Two things to take from the shape of that table. A float rescorer's cost is
+almost entirely per-candidate, so it is the configuration that punishes depth;
+this crate flattens that, which is what makes a deeper, more accurate candidate
+list affordable. And at shallow depths stage 1 dominates and no stage-2 kernel
+can help you — measure your own split before assuming this is your bottleneck.
 
 ## Provenance and license
 
