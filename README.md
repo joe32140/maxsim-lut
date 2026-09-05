@@ -23,6 +23,12 @@ in-register table lookup, and the dot runs on `sdot`, `smmla`, `maddubs` or
 cargo add maxsim-lut
 ```
 
+Or track the repository directly:
+
+```toml
+maxsim-lut = { git = "https://github.com/joe32140/maxsim-lut" }
+```
+
 No dependencies, and none are added to your tree. MSRV 1.89.
 
 ## Use
@@ -76,7 +82,7 @@ kernel by measuring the host core.
 Ranking is unchanged: the two asymmetric rows are bit-identical to each other.
 
 Details, the candidate-depth sweep, and the v1-to-now history are in
-[docs/benchmarks.md](docs/benchmarks.md).
+[docs/benchmarks.md](https://github.com/joe32140/maxsim-lut/blob/main/docs/benchmarks.md).
 
 ## Preconditions
 
@@ -93,12 +99,14 @@ across cells will see the kernel run and the speedup vanish.
 
 ## More
 
-- [docs/kernels.md](docs/kernels.md) — the five kernels, why dispatch measures
-  the host core instead of reading feature bits, the overrides, and which
-  kernels have run on real silicon.
-- [docs/benchmarks.md](docs/benchmarks.md) — how the numbers above were taken,
-  the depth sweep, and what changed since the crate's first commit.
-- [docs/testing.md](docs/testing.md) — how the bit-exactness contract is held.
+- [docs/kernels.md](https://github.com/joe32140/maxsim-lut/blob/main/docs/kernels.md)
+  — the five kernels, why dispatch measures the host core instead of reading
+  feature bits, the overrides, and which kernels have run on real silicon.
+- [docs/benchmarks.md](https://github.com/joe32140/maxsim-lut/blob/main/docs/benchmarks.md)
+  — how the numbers above were taken, the depth sweep, and what changed since
+  the crate's first commit.
+- [docs/testing.md](https://github.com/joe32140/maxsim-lut/blob/main/docs/testing.md)
+  — how the bit-exactness contract is held.
 
 ## Background
 
