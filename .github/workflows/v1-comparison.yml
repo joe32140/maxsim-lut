@@ -1,0 +1,51 @@
+name: v1-comparison
+
+# Manual: measure the crate's first kernel (commit aa2ecba, the straight
+# extraction from next-plaid) against current main on every runner class, on
+# the same day and the same machine, so the cumulative speedup per
+# architecture is one measurement rather than a quote stitched across two
+# benchmark harnesses and a changed runner pool.
+#
+# The two versions are separate processes, so the arms are alternated and
+# each is reduced by its minimum. Both accept the same arguments and both
+# print `<kernel>: <ns> ns/token`.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  compare:
+    name: v1 vs main (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: identify the CPU
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            sysctl -n machdep.cpu.brand_string
+          else
+            lscpu | grep -E "Model name"
+          fi
+      - name: lay out v1 beside main
+        run: git worktree add ../v1 aa2ecba && git -C ../v1 log --oneline -1
+      - name: build both benches
+        run: |
+          cargo build --release --example bench
+          cargo build --release --example bench --manifest-path ../v1/Cargo.toml
+      - name: alternate v1 and main, 5 rounds
+        run: |
+          for i in 1 2 3 4 5; do
+            echo "--- round $i, v1"
+            ../v1/target/release/examples/bench 128 4 32 240 256 | grep -E "ns/token"
+            echo "--- round $i, main"
+            ./target/release/examples/bench 128 4 32 240 256 | grep -E "ns/token|noise"
+          done
