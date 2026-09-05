@@ -22,9 +22,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - name: identify this runner's core
+        # The pool is mixed and rotates, so every log has to say which silicon
+        # produced its numbers and its kernel coverage.
+        run: |
+          uname -m
+          sysctl -n machdep.cpu.brand_string 2>/dev/null || \
+            grep -m1 'model name' /proc/cpuinfo || true
       - run: cargo fmt --check
       - run: cargo clippy --all-targets
       - run: cargo test
+      - name: list the kernels this runner can execute
+        run: cargo run --example kernels
       - name: list the kernels the unit test exercised on this runner
         run: cargo test --lib every_supported_kernel -- --nocapture 2>&1 | grep "kernels exercised"
       - name: test forced-scalar path
