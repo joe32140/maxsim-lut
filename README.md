@@ -130,12 +130,20 @@ double width nets nothing and the extra interleaving makes it lose; the N2
 issues both at the same rate and gains 1.4× in the block shape. Two cores,
 same feature bits, opposite answers.
 
-So dispatch **calibrates**: on the first score of a process with more than
-one executable kernel, each candidate scores a small synthetic document,
-interleaved, and the winner is cached. It costs a few hundred microseconds
-once. This is safe to decide at runtime precisely because every kernel is
-bit-identical, so calibration can change how long a search takes and never
-what it returns.
+So dispatch **calibrates**: on the first score of a process, each candidate
+kernel is checked against the scalar reference on a small synthetic document
+and dropped if it disagrees, then the survivors are timed interleaved and the
+winner is cached. It costs a few hundred microseconds once. Choosing at
+runtime is safe precisely because every kernel is bit-identical, so
+calibration can change how long a search takes and never what it returns.
+
+The self-check is there because CI cannot cover every instruction: GitHub's
+x86 runners are a mixed pool, and at the time of writing the Linux x86 runner
+is an AMD EPYC 7763 with neither AVX-512 nor AVX-VNNI, so `avx2-vnni` is
+compile-checked but never executed there. A kernel whose instruction no CI
+machine has must prove itself on the host before dispatch will use it; if
+none verifies, scoring falls back to the reference path and
+`Lut::kernel(dim)` reports `scalar (SelfCheckFailed)`.
 
 Override it when you need to:
 

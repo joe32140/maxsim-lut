@@ -18,9 +18,9 @@
 //!
 //! Feature detection alone therefore cannot pick the fastest path: two cores
 //! with identical feature bits disagree. [`select`] instead **measures**
-//! them. On the first dispatch of a process that has more than one
-//! executable kernel, [`calibrate`] scores a small synthetic document with
-//! each candidate, interleaved, and caches the winner for the process.
+//! them. On the first dispatch of a process, [`calibrated`] scores a small
+//! synthetic document with each candidate, checks it against the scalar
+//! reference, times the survivors interleaved, and caches the winner.
 //!
 //! This is safe to do at runtime precisely because the kernels are
 //! bit-identical: calibration can change how long a search takes, never what
@@ -81,6 +81,11 @@ pub enum ScalarReason {
     /// This CPU lacks the required feature (NEON `dotprod`, AVX2), or the
     /// architecture has no SIMD path at all.
     CpuUnsupported,
+    /// Every SIMD kernel this CPU claims to support disagreed with the
+    /// scalar reference on the calibration probe, so none was trusted. This
+    /// should be unreachable; it means a kernel is miscompiled or the CPU
+    /// misreports a feature, and it trades speed for a correct answer.
+    SelfCheckFailed,
 }
 
 impl std::fmt::Display for Kernel {
@@ -113,10 +118,10 @@ fn env_force_scalar() -> bool {
 }
 
 /// `MAXSIM_LUT_KERNEL=<name>` pins a SIMD kernel by its `Display` name
-/// (`neon-sdot`, `avx2`, `avx512-vnni`), for benchmarking a path the CPU
-/// would not dispatch to by default (e.g. AVX2 on an AVX-512 machine). It is
-/// honoured only when the CPU supports that kernel and the shape is SIMD
-/// eligible; otherwise dispatch proceeds normally. Read once per process.
+/// (`neon-sdot`, `neon-i8mm`, `avx2`, `avx2-vnni`, `avx512-vnni`), for
+/// benchmarking a path calibration would not choose. It is honoured only
+/// when the CPU supports that kernel and the shape is SIMD eligible;
+/// otherwise dispatch proceeds normally. Read once per process.
 fn env_pin() -> Option<Kernel> {
     static PIN: OnceLock<Option<Kernel>> = OnceLock::new();
     *PIN.get_or_init(|| match std::env::var("MAXSIM_LUT_KERNEL").ok()?.as_str() {
@@ -175,31 +180,40 @@ fn env_no_calibrate() -> bool {
     })
 }
 
-/// The fastest of this CPU's kernels on a representative shape, measured
-/// once per process.
+/// The fastest *verified* kernel for this CPU, decided once per process.
 ///
-/// The shape (32 query rows × 64 document tokens, dim 128, nbits 4) is the
-/// ColBERT working point; the arms are interleaved and reduced by minimum,
+/// The probe shape (32 query rows × 64 document tokens, dim 128, nbits 4) is
+/// the ColBERT working point. Each candidate is first checked against the
+/// scalar reference on that probe and dropped if it disagrees, then the
+/// survivors are timed with their arms interleaved and reduced by minimum,
 /// so a scheduling hiccup has to hit every repetition of one arm to change
-/// the verdict. Any outcome is correct, only slower or faster, so there is
-/// no failure mode to guard against: on any error building the probe the
-/// first candidate is kept.
+/// the verdict.
+///
+/// The check matters for a kernel whose instruction this build's CI has no
+/// hardware for: it cannot be shipped on the strength of a compile alone, so
+/// it proves itself on the host before dispatch will use it. It costs one
+/// extra scalar scoring of the probe, once.
 fn calibrated() -> Kernel {
     static CHOICE: OnceLock<Kernel> = OnceLock::new();
     *CHOICE.get_or_init(|| {
         let cands = cpu_kernels();
         match cands.first() {
             None => Kernel::Scalar(ScalarReason::CpuUnsupported),
-            Some(&first) if cands.len() == 1 || env_no_calibrate() => first,
-            Some(&first) => measure_fastest(cands).unwrap_or(first),
+            Some(&first) if env_no_calibrate() => first,
+            Some(&first) => measure_fastest(cands, first),
         }
     })
 }
 
-/// Time each candidate on a synthetic document; `None` if the probe could
-/// not be built (which cannot happen for the constants below, but the
-/// fallback keeps dispatch total).
-fn measure_fastest(cands: &[Kernel]) -> Option<Kernel> {
+/// Verify each candidate against the scalar reference on a synthetic
+/// document, then time the survivors.
+///
+/// `fallback` is returned unmeasured if the probe cannot be built, which the
+/// constants below make impossible but which keeps dispatch total without a
+/// panic. If the probe builds and *no* candidate reproduces the reference,
+/// the result is `Scalar(SelfCheckFailed)`: a wrong fast answer is worse
+/// than a slow right one.
+fn measure_fastest(cands: &[Kernel], fallback: Kernel) -> Kernel {
     const DIM: usize = 128;
     const NQ: usize = 32;
     const NTOK: usize = 64;
@@ -207,13 +221,17 @@ fn measure_fastest(cands: &[Kernel]) -> Option<Kernel> {
     const ITERS: usize = 8;
 
     let weights: Vec<f32> = (0..16).map(|i| -0.35 + 0.05 * i as f32).collect();
-    let lut = Lut::colbert(4, &weights).ok()?;
+    let Ok(lut) = Lut::colbert(4, &weights) else {
+        return fallback;
+    };
     // Deterministic pseudo-random inputs: the kernels are data-independent
     // (no branches on values), so any well-mixed content times the same.
     let query: Vec<f32> = (0..NQ * DIM)
         .map(|i| ((i * 37 % 251) as f32 / 251.0) - 0.5)
         .collect();
-    let q = PreparedQuery::new(&lut, &query, NQ, DIM).ok()?;
+    let Ok(q) = PreparedQuery::new(&lut, &query, NQ, DIM) else {
+        return fallback;
+    };
     let pdim = DIM / lut.keys_per_byte();
     let packed: Vec<u8> = (0..NTOK * pdim).map(|i| (i * 97 % 256) as u8).collect();
     let inv: Vec<f32> = (0..NTOK).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect();
@@ -228,24 +246,45 @@ fn measure_fastest(cands: &[Kernel]) -> Option<Kernel> {
         inv_norms: Some(&inv),
     };
 
-    let mut best = vec![f64::INFINITY; cands.len()];
+    // Self-check: a kernel that does not reproduce the reference bit for bit
+    // on this CPU is not a candidate, however fast it is.
+    let want = scalar(&lut, &args).to_bits();
+    let verified: Vec<Kernel> = cands
+        .iter()
+        .copied()
+        .filter(|&k| {
+            let ok = run(k, &lut, &args).to_bits() == want;
+            debug_assert!(
+                ok,
+                "{k} disagreed with the scalar reference on the calibration probe"
+            );
+            ok
+        })
+        .collect();
+    let Some((&first, rest)) = verified.split_first() else {
+        return Kernel::Scalar(ScalarReason::SelfCheckFailed);
+    };
+    if rest.is_empty() {
+        return first;
+    }
+
+    let mut best = vec![f64::INFINITY; verified.len()];
     for _ in 0..REPS {
-        for (i, &k) in cands.iter().enumerate() {
+        for (slot, &k) in best.iter_mut().zip(&verified) {
             let t = Instant::now();
             for _ in 0..ITERS {
                 black_box(run(k, &lut, &args));
             }
-            let ns = t.elapsed().as_secs_f64();
-            best[i] = best[i].min(ns);
+            *slot = slot.min(t.elapsed().as_secs_f64());
         }
     }
     let mut winner = 0usize;
-    for i in 1..cands.len() {
+    for i in 1..verified.len() {
         if best[i] < best[winner] {
             winner = i;
         }
     }
-    Some(cands[winner])
+    verified[winner]
 }
 
 /// The dispatch decision, in one place, so [`Lut::kernel`] and
@@ -436,6 +475,22 @@ mod tests {
         fn f32(&mut self, lo: f32, hi: f32) -> f32 {
             lo + (hi - lo) * ((self.next() >> 40) as f32 / (1u64 << 24) as f32)
         }
+    }
+
+    /// Calibration only ever returns something dispatch may legally run: a
+    /// kernel this CPU supports, or the scalar reference if none verified.
+    #[test]
+    fn calibration_picks_a_supported_kernel() {
+        let k = calibrated();
+        assert!(
+            cpu_kernels().contains(&k) || matches!(k, Kernel::Scalar(_)),
+            "calibration returned {k}, which is not executable here"
+        );
+        assert_ne!(
+            k,
+            Kernel::Scalar(ScalarReason::SelfCheckFailed),
+            "a kernel this CPU claims to support disagreed with the scalar reference"
+        );
     }
 
     /// Every executable kernel agrees bitwise with the scalar reference. This
