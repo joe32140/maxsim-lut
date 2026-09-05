@@ -21,9 +21,10 @@ pub struct PreparedQuery {
     /// (`d = i·keys_per_byte + k`), so the SIMD expand stores each `tbl`
     /// result contiguously. A dot product is permutation-invariant and the
     /// integer accumulator is order-invariant, so this changes no result.
-    /// Only the SIMD kernels read these; on targets without one they are
-    /// still built (cheap, `nq · 64..256` bytes) so the layout stays tested.
-    #[cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86_64")), allow(dead_code))]
+    /// The NEON kernel reads `planes` directly; the x86 kernels read the
+    /// derived `tiles`. Both are always built (cheap, a few KB) so the layout
+    /// stays tested on every target.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     planes: Vec<i8>,
     #[cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86_64")), allow(dead_code))]
     stride: usize,
@@ -137,7 +138,7 @@ impl PreparedQuery {
         &self.scales
     }
 
-    #[cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn planes(&self) -> &[i8] {
         &self.planes
     }

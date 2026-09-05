@@ -85,8 +85,23 @@ cargo test
 MAXSIM_LUT_FORCE_SCALAR=1 cargo test
 ```
 
-CI runs both on x86_64 (AVX2) and aarch64 (NEON dotprod), plus `cargo check`
-for a target with no SIMD path.
+The unit test `every_supported_kernel_matches_scalar_bitwise` runs every
+kernel the CPU can execute, not just the one dispatch would pick, so an
+AVX-512 machine also verifies the AVX2 path. `MAXSIM_LUT_KERNEL=avx2` (or
+`neon-sdot`, `avx512-vnni`) pins dispatch to a supported kernel for
+benchmarking it. CI runs on x86_64 (AVX-512 VNNI and AVX2) and aarch64 (NEON
+dotprod), plus `cargo check` for a target with no SIMD path.
+
+## Kernel shape
+
+All three SIMD kernels expand a document token's packed bytes once (16-entry
+in-register table per nibble) and then reuse those weights against every
+query row, holding several tokens' weights and several rows in registers at
+once. NEON keeps one accumulator per (row, token) and reduces with `sdot`;
+the x86 kernels put 8 or 16 query rows into the lanes of one accumulator and
+broadcast the weights 4 bytes at a time (`vpdpbusd` / `vpmaddubsw`), so no
+horizontal reduction is ever needed. On AVX-512 the query is stored `+128` as
+`u8` and the exact offset `128·Σw` is subtracted once per token.
 
 ## Provenance and license
 

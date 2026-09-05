@@ -33,6 +33,11 @@ jobs:
           MAXSIM_LUT_FORCE_SCALAR: "1"
       - name: report the kernel this runner dispatches to
         run: cargo run --release --example bench -- 128 4 32 240 256
+      - name: bench the AVX2 path too (x86 runners dispatch to AVX-512)
+        if: runner.arch == 'X64'
+        run: cargo run --release --example bench -- 128 4 32 240 256
+        env:
+          MAXSIM_LUT_KERNEL: avx2
 
   no-simd-target:
     name: check (wasm32, scalar only)
