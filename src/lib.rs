@@ -91,7 +91,7 @@ mod packing;
 mod query;
 mod scorer;
 
-pub use kernel::{supported_kernels, Kernel};
+pub use kernel::{supported_kernels, Kernel, ScalarReason};
 pub use lut::{Lut, NibbleTables, MAX_DIM};
 pub use packing::{ColbertPacking, Packing};
 pub use query::PreparedQuery;

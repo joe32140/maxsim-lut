@@ -198,9 +198,15 @@ fn pinned_kernels_agree_with_the_calibrated_default() {
 
     let want = score(&lut.clone().force_scalar(true));
     assert_eq!(score(&lut).to_bits(), want.to_bits(), "calibrated default");
+    // `MAXSIM_LUT_FORCE_SCALAR=1` outranks a pin by design: it is the escape
+    // hatch that must always reach the reference path. Under it there is no
+    // kernel choice left to assert, only that scores are unaffected.
+    let honours_pins = lut.kernel(dim).is_simd();
     for &k in supported_kernels() {
         let pinned = lut.clone().pin_kernel(Some(k));
-        assert_eq!(pinned.kernel(dim), k, "pin_kernel({k}) was not honoured");
+        if honours_pins {
+            assert_eq!(pinned.kernel(dim), k, "pin_kernel({k}) was not honoured");
+        }
         assert_eq!(score(&pinned).to_bits(), want.to_bits(), "{k} vs scalar");
     }
     // A kernel this CPU cannot execute is ignored, and scoring still works.
@@ -213,6 +219,15 @@ fn pinned_kernels_agree_with_the_calibrated_default() {
         let ignored = lut.clone().pin_kernel(Some(alien));
         assert_ne!(ignored.kernel(dim), alien, "an unsupported pin was honoured");
         assert_eq!(score(&ignored).to_bits(), want.to_bits());
+    }
+    // force_scalar always wins over a pin, whatever the environment says.
+    for &k in supported_kernels() {
+        let both = lut.clone().pin_kernel(Some(k)).force_scalar(true);
+        assert!(
+            !both.kernel(dim).is_simd(),
+            "force_scalar lost to pin_kernel({k})"
+        );
+        assert_eq!(score(&both).to_bits(), want.to_bits());
     }
 }
 
