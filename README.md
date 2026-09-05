@@ -26,21 +26,29 @@ Wired into [next-plaid](https://github.com/lightonai/next-plaid) 1.7.0 and run
 on SciFact (5,183 docs, 1.25M tokens, ColBERTv2, dim 128, nbits 4) with 50 real
 queries at that release's default search parameters, on an Apple M4:
 
-| stage-2 route | stage 2 | end-to-end | vs float |
+| build | stage 1 | stage 2 | end-to-end |
 |---|---|---|---|
-| decompress to f32, then MaxSim (what next-plaid ≤1.6.5 did) | 12.03 ms | 14.13 ms | 1.00× |
-| the LUT kernel this crate started from (next-plaid 1.7.0) | 3.29 ms | 5.61 ms | 2.52× |
-| **this crate** | **1.63 ms** | **3.87 ms** | **3.65×** |
+| next-plaid 1.6.5, which decompressed to f32 and then scored | 5.01 ms | 14.22 ms | 19.26 ms |
+| next-plaid 1.7.0, the release that introduced this LUT kernel | 2.05 ms | 3.26 ms | 5.54 ms |
+| **1.7.0 with its stage 2 replaced by this crate** | 2.02 ms | **1.63 ms** | **3.87 ms** |
+
+Read the two steps separately, because only the second one is this crate's.
+1.6.5 → 1.7.0 is **3.47×** end-to-end, and most of that is the LUT kernel
+arriving (stage 2 4.36×) rather than anything here; that release also made
+stage 1 2.45× faster. Swapping in this crate is a further **1.45×**
+end-to-end, from **2.00×** on stage 2. Against 1.6.5 the two together are
+**8.7× on stage 2 and 4.98× end-to-end**.
 
 Same documents, same ranking: the two asymmetric rows are bit-identical to each
 other, and both differ from full decompression on 3 of 50 top-10 lists — that
 is the int8 query quantisation, unchanged by anything here.
 
-So: **7.4× on stage 2 and 3.65× end-to-end** against a float-decompression
-rescorer, or **2.0× and 1.45×** if your engine already has the unblocked LUT
-kernel. The end-to-end figure is bounded by whatever else your query does —
-here stage 2 falls from 85% of the query to 42% of it, and how much you gain
-depends on your candidate depth (a sweep is in [real data](#real-data)).
+The end-to-end figure is bounded by whatever else your query does — here stage
+2 falls from 74% of the query to 42% of it — and by how deep your candidate
+list is (a sweep is in [real data](#real-data)). Both versions ran with
+identical search parameters; next-plaid's own published figure for 1.6.5 → 1.7.0
+is higher (4.3–5.4×), measured on a different checkpoint and with each version's
+parameters tuned to matched quality rather than held equal.
 
 ## Install
 
@@ -342,19 +350,24 @@ How much you gain end-to-end depends on how many candidates you rescore, since
 stage 1 does not shrink. On this index, with `n_full_scores/4` documents
 rescored:
 
-| candidates rescored | ≤1.6.5 float | 1.7.0 LUT | this crate | vs float |
-|---|---|---|---|---|
-| 64 | 2.71 ms | 2.40 | 2.22 | 1.22× |
-| 128 | 3.45 | 2.64 | 2.35 | 1.47× |
-| 256 | 4.91 | 3.07 | 2.57 | 1.91× |
-| 512 | 7.77 | 3.91 | 3.03 | 2.56× |
-| 1024 (1.7.0 default) | 13.57 | 5.58 | 3.84 | 3.54× |
+| candidates rescored | 1.7.0 | with this crate | end-to-end |
+|---|---|---|---|
+| 64 | 2.40 ms | 2.22 | 1.08× |
+| 128 | 2.64 | 2.35 | 1.12× |
+| 256 | 3.07 | 2.57 | 1.19× |
+| 512 | 3.91 | 3.03 | 1.29× |
+| 1024 (1.7.0 default) | 5.58 | 3.84 | 1.45× |
 
-Two things to take from the shape of that table. A float rescorer's cost is
-almost entirely per-candidate, so it is the configuration that punishes depth;
-this crate flattens that, which is what makes a deeper, more accurate candidate
-list affordable. And at shallow depths stage 1 dominates and no stage-2 kernel
-can help you — measure your own split before assuming this is your bottleneck.
+At shallow depths stage 1 dominates and no stage-2 kernel can help you; the
+gain arrives as the rescore list grows. Measure your own split before assuming
+this is your bottleneck.
+
+The 1.6.5 column is deliberately absent here. Its rescore loop dispatched 128
+documents per task, so 64 and 128 candidates both ran on a single thread and
+256 on two — its depth curve is a picture of thread utilisation rather than of
+per-candidate cost, and putting it beside the others would compare the wrong
+thing. At the default depth, where that effect is smallest, it is the 19.26 ms
+in the table at the top.
 
 ## Provenance and license
 
