@@ -2,7 +2,9 @@
 //! the reference matches an f64 recomputation, and the optional terms behave
 //! as identities.
 
-use maxsim_lut::{Codes, ColbertPacking, DocView, Kernel, Lut, Packing, PreparedQuery, Scorer};
+use maxsim_lut::{
+    supported_kernels, Codes, ColbertPacking, DocView, Kernel, Lut, Packing, PreparedQuery, Scorer,
+};
 
 /// Deterministic xorshift so the tests carry no `rand` dependency.
 struct Rng(u64);
@@ -166,6 +168,52 @@ fn simd_matches_scalar_bitwise_across_shapes() {
         );
     }
     let _ = simd_seen;
+}
+
+/// Every kernel the CPU can run scores identically through the public
+/// pinning API, and pinning a kernel the CPU cannot run is ignored rather
+/// than fatal. This is the host-visible form of the internal all-kernel
+/// test: it also proves the calibrated default cannot change a score.
+#[test]
+fn pinned_kernels_agree_with_the_calibrated_default() {
+    let mut rng = Rng(0x0F4933E2A9B1C7D5);
+    let (nq, dim, nbits) = (32usize, 128usize, 4usize);
+    let p = ColbertPacking::new(nbits).unwrap();
+    let w = weights(nbits, &mut rng);
+    let lut = Lut::new(&p, &w).unwrap();
+    let query: Vec<f32> = (0..nq * dim).map(|_| rng.f32(-1.0, 1.0)).collect();
+    let q = PreparedQuery::new(&lut, &query, nq, dim).unwrap();
+    let ncent = 7;
+    let cdot: Vec<f32> = (0..ncent * nq).map(|_| rng.f32(-1.0, 1.0)).collect();
+    let doc = make_doc(&p, dim, 37, ncent, 2, &mut rng);
+    let view = DocView::new(&doc.packed, doc.ntok, doc.stride)
+        .codes(Codes::U32(&doc.codes))
+        .inv_norms(&doc.inv);
+    let score = |l: &Lut| {
+        Scorer::new(l, &q)
+            .with_centroid_term(&cdot, ncent)
+            .unwrap()
+            .score(view)
+    };
+
+    let want = score(&lut.clone().force_scalar(true));
+    assert_eq!(score(&lut).to_bits(), want.to_bits(), "calibrated default");
+    for &k in supported_kernels() {
+        let pinned = lut.clone().pin_kernel(Some(k));
+        assert_eq!(pinned.kernel(dim), k, "pin_kernel({k}) was not honoured");
+        assert_eq!(score(&pinned).to_bits(), want.to_bits(), "{k} vs scalar");
+    }
+    // A kernel this CPU cannot execute is ignored, and scoring still works.
+    let alien = if cfg!(target_arch = "x86_64") {
+        Kernel::NeonSdot
+    } else {
+        Kernel::Avx512Vnni
+    };
+    if !supported_kernels().contains(&alien) {
+        let ignored = lut.clone().pin_kernel(Some(alien));
+        assert_ne!(ignored.kernel(dim), alien, "an unsupported pin was honoured");
+        assert_eq!(score(&ignored).to_bits(), want.to_bits());
+    }
 }
 
 #[test]

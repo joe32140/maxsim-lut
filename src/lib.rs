@@ -21,9 +21,16 @@
 //! # What is inside, what is outside
 //!
 //! Inside: the loop order (doc-token-outer, so each token expands once and is
-//! reused across every query row), the SIMD (NEON `tbl`+`sdot`, AVX2
-//! `pshufb`+`maddubs`, AVX-512 VNNI), the runtime dispatch, and a scalar
-//! reference every SIMD path must match **bit-for-bit**.
+//! reused across every query row), the SIMD (NEON `sdot` and `smmla`, AVX2,
+//! AVX-VNNI and AVX-512 VNNI), the runtime dispatch, and a scalar reference
+//! every SIMD path must match **bit-for-bit**.
+//!
+//! Where an architecture offers more than one int8 dot instruction, the
+//! faster one depends on the core rather than on the feature bits: Arm's
+//! Neoverse N2 doubles its throughput with `smmla` while Apple's M4 loses
+//! with it. Dispatch therefore measures the candidates once per process and
+//! caches the winner ([`supported_kernels`], [`Lut::pin_kernel`]). Because
+//! every kernel is bit-identical, that choice can only change speed.
 //!
 //! Outside: candidate generation, IVF, storage, threads. The crate has no
 //! dependencies and owns no thread pool; [`Lut`], [`PreparedQuery`] and
@@ -84,7 +91,7 @@ mod packing;
 mod query;
 mod scorer;
 
-pub use kernel::Kernel;
+pub use kernel::{supported_kernels, Kernel};
 pub use lut::{Lut, NibbleTables, MAX_DIM};
 pub use packing::{ColbertPacking, Packing};
 pub use query::PreparedQuery;

@@ -37,6 +37,14 @@ pub struct PreparedQuery {
     /// subtracts `128 · Σw` per token. Rows past `nq` hold 128 (code 0).
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     tiles: Vec<u8>,
+    /// The same plane-order codes as *row pairs* for the `smmla` matrix
+    /// instruction: `[⌈nq/2⌉ pairs][stride/8 groups][16 bytes]`, each 16-byte
+    /// group holding 8 consecutive plane dims of row `2p` followed by the
+    /// same 8 dims of row `2p+1`. `smmla` multiplies such a 2×8 query block
+    /// against a 2×8 block of two tokens' weights into a 2×2 accumulator.
+    /// The odd row of an odd `nq` is all zeros.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pairs: Vec<i8>,
     /// Per row: `scales[q] · lut.scale`, the query-constant factor the fold
     /// applies to each integer accumulator.
     sqw: Vec<f32>,
@@ -103,6 +111,14 @@ impl PreparedQuery {
                 tiles[(t * d4n + d / 4) * 64 + r * 4 + (d % 4)] = (v as i16 + 128) as u8;
             }
         }
+        let npairs = nq.div_ceil(2);
+        let mut pairs = vec![0i8; npairs * 2 * stride];
+        for qi in 0..nq {
+            let (p, r) = (qi / 2, qi % 2);
+            for d in 0..dim {
+                pairs[p * 2 * stride + (d / 8) * 16 + r * 8 + (d % 8)] = planes[qi * stride + d];
+            }
+        }
         let sqw = scales.iter().map(|&s| s * lut.scale()).collect();
         Ok(Self {
             nq,
@@ -112,6 +128,7 @@ impl PreparedQuery {
             planes,
             stride,
             tiles,
+            pairs,
             sqw,
             zeros: vec![0.0f32; nq],
             lut_fingerprint: lut.fingerprint(),
@@ -151,6 +168,12 @@ impl PreparedQuery {
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn tiles_u8(&self) -> &[u8] {
         &self.tiles
+    }
+    /// Row-pair layout for `smmla`; see the field docs. Pair `p` starts at
+    /// `p · 2 · stride`; dim group `g` (8 dims) of it at `+ g · 16`.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn pairs(&self) -> &[i8] {
+        &self.pairs
     }
     pub(crate) fn sqw(&self) -> &[f32] {
         &self.sqw
@@ -199,6 +222,32 @@ mod tests {
                 let idx = (tile * 16 + d / 4) * 64 + r * 4 + d % 4;
                 assert_eq!(t[idx] as i16 - 128, p.planes()[qi * 64 + d] as i16);
             }
+        }
+        // Row pairs: one pair of 2 · stride bytes; group 0 = row 0's first 8
+        // plane dims then row 1's (zero); every later group is zero padding.
+        let pr = p.pairs();
+        assert_eq!(pr.len(), 2 * 64);
+        assert_eq!(&pr[..8], &p.planes()[..8]);
+        assert!(pr[8..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn row_pairs_interleave_eight_dims_at_a_time() {
+        let lut = Lut::colbert(4, &[0.0; 16]).unwrap();
+        let (nq, dim) = (3, 24);
+        let q: Vec<f32> = (0..nq * dim).map(|i| (i % 13) as f32 - 6.0).collect();
+        let p = PreparedQuery::new(&lut, &q, nq, dim).unwrap();
+        let pr = p.pairs();
+        assert_eq!(pr.len(), 2 * 2 * 64, "⌈3/2⌉ pairs × 2 · stride");
+        for qi in 0..nq {
+            for d in 0..dim {
+                let idx = (qi / 2) * 128 + (d / 8) * 16 + (qi % 2) * 8 + d % 8;
+                assert_eq!(pr[idx], p.planes()[qi * 64 + d], "row {qi} dim {d}");
+            }
+        }
+        // The phantom fourth row is zero.
+        for g in 0..3 {
+            assert!(pr[128 + g * 16 + 8..128 + g * 16 + 16].iter().all(|&b| b == 0));
         }
     }
 

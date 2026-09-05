@@ -42,6 +42,7 @@ pub struct Lut {
     scale: f32,
     nibble: Option<NibbleTables>,
     force_scalar: bool,
+    pin: Option<Kernel>,
 }
 
 impl Lut {
@@ -87,6 +88,7 @@ impl Lut {
             scale,
             nibble,
             force_scalar: false,
+            pin: None,
         })
     }
 
@@ -101,6 +103,21 @@ impl Lut {
     /// effect process-wide.
     pub fn force_scalar(mut self, yes: bool) -> Self {
         self.force_scalar = yes;
+        self
+    }
+
+    /// Pin dispatch to one kernel instead of the calibrated choice.
+    ///
+    /// Only a kernel this CPU can execute is honoured (check with
+    /// [`crate::supported_kernels`]); anything else is ignored and dispatch
+    /// proceeds normally, because a kernel the CPU cannot run has no
+    /// meaningful behaviour to fall back to. Scoring is bit-identical
+    /// whichever kernel runs, so this only affects speed.
+    ///
+    /// Use it to benchmark one path, or to make dispatch deterministic on a
+    /// fleet of mixed cores. `None` restores the default.
+    pub fn pin_kernel(mut self, kernel: Option<Kernel>) -> Self {
+        self.pin = kernel;
         self
     }
 
@@ -147,6 +164,10 @@ impl Lut {
 
     pub(crate) fn force_scalar_set(&self) -> bool {
         self.force_scalar
+    }
+
+    pub(crate) fn pinned_kernel(&self) -> Option<Kernel> {
+        self.pin
     }
 
     /// Two [`Lut`]s prepared from the same weights and packing are
