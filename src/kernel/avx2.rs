@@ -29,7 +29,7 @@ const NT: usize = 4;
 /// # Safety
 /// `row.len() == pdim`, `kpb · pdim <= MAX_DIM`, tables loaded for `kpb` keys.
 #[inline(always)]
-unsafe fn expand(
+pub(super) unsafe fn expand(
     row: &[u8],
     tabs: &[__m128i; 8],
     nib: &NibbleTables,
@@ -75,7 +75,7 @@ unsafe fn expand(
 /// # Safety
 /// AVX2.
 #[inline(always)]
-unsafe fn lane_mask(rem: usize) -> __m256i {
+pub(super) unsafe fn lane_mask(rem: usize) -> __m256i {
     // SAFETY: register-only ops.
     unsafe {
         let idx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
@@ -151,7 +151,7 @@ unsafe fn block<const RT: usize, const N: usize>(
 
 /// Address of 8-row tile `r8` in the `u8` tile array.
 #[inline(always)]
-unsafe fn tile8(tiles: *const u8, tile_stride: usize, r8: usize) -> *const u8 {
+pub(super) unsafe fn tile8(tiles: *const u8, tile_stride: usize, r8: usize) -> *const u8 {
     // SAFETY: caller guarantees `r8 < 2 · n16`.
     unsafe { tiles.add((r8 / 2) * tile_stride + (r8 % 2) * 32) }
 }

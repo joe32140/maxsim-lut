@@ -10,6 +10,10 @@
 //! accumulator chains instead of 4. The integer sums are identical to the
 //! unblocked form (same products, exact integer addition), so the result is
 //! bit-identical.
+//!
+//! `expand`, `fold4` and `fold_tail` are shared with the `smmla` kernel in
+//! `neon_i8mm.rs`, which differs only in the dot instruction and the query
+//! layout that instruction needs.
 
 use std::arch::aarch64::*;
 
@@ -51,7 +55,14 @@ unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
 /// # Safety
 /// `base + 4 <= nq`; `crow` readable for `base + 4` f32s.
 #[inline(always)]
-unsafe fn fold4(accv: int32x4_t, base: usize, sqw: &[f32], crow: *const f32, inv: f32, best: &mut [f32]) {
+pub(super) unsafe fn fold4(
+    accv: int32x4_t,
+    base: usize,
+    sqw: &[f32],
+    crow: *const f32,
+    inv: f32,
+    best: &mut [f32],
+) {
     // SAFETY: see function contract.
     unsafe {
         let a = vcvtq_f32_s32(accv);
@@ -73,7 +84,7 @@ unsafe fn fold4(accv: int32x4_t, base: usize, sqw: &[f32], crow: *const f32, inv
 /// # Safety
 /// `crow` readable for `accs.len()` f32s from its base.
 #[inline(always)]
-unsafe fn fold_tail(accs: &[i32], sqw: &[f32], crow: *const f32, inv: f32, best: &mut [f32]) {
+pub(super) unsafe fn fold_tail(accs: &[i32], sqw: &[f32], crow: *const f32, inv: f32, best: &mut [f32]) {
     for i in 0..accs.len() {
         // SAFETY: see function contract.
         let c = unsafe { *crow.add(i) };
@@ -89,7 +100,7 @@ unsafe fn fold_tail(accs: &[i32], sqw: &[f32], crow: *const f32, inv: f32, best:
 /// # Safety
 /// `row.len() == pdim`, `kpb · pdim <= MAX_DIM`, tables loaded for `kpb` keys.
 #[inline(always)]
-unsafe fn expand(
+pub(super) unsafe fn expand(
     row: &[u8],
     tabs: &[int8x16_t; 8],
     nib: &NibbleTables,
