@@ -156,17 +156,41 @@ MAXSIM_LUT_NO_CALIBRATE=1       # take the first listed kernel, skip measuring
 MAXSIM_LUT_FORCE_SCALAR=1       # the reference path
 ```
 
-## Register blocking and tiles
+## How much faster than the first version
 
-Measured effect of the two structural changes over the straightforward
-one-token, one-row-accumulator kernels this crate started from (32 query rows
-× 240 tokens, dim 128, nbits 4, ns per scored token, bit-identical results):
+Three structural changes separate the current kernels from the crate's first
+commit (`aa2ecba`, the straight extraction from next-plaid): register
+blocking, the GEMM-tile form on x86, and the per-core kernel choice above.
+The `v1-comparison` workflow builds that commit beside current `main` and
+alternates the two on one machine, so each row below is a single same-day
+measurement rather than a figure stitched across harnesses (32 query rows ×
+240 tokens, dim 128, nbits 4, ns per scored token, minimum of 5 alternated
+rounds, bit-identical results throughout):
 
-| machine | before | register blocking | + GEMM tiles |
-|---|---|---|---|
-| Apple M4 (NEON sdot) | 70.6 | 32.7 | n/a |
-| GitHub x86 runner (AVX-512 VNNI) | 143.8 | 86.3 | 37.2 |
-| GitHub `ubuntu-24.04-arm` (NEON sdot) | 159.0 | 73.8 | n/a |
+| core | v1 | now | total | where it comes from |
+|---|---|---|---|---|
+| Neoverse N2 (`ubuntu-24.04-arm`) | 159.7 | 63.2 | **2.53×** | blocking 2.16×, then `smmla` 1.17× |
+| Apple M1 (`macos-14`) | 120.9 | 43.3 | **2.79×** | blocking only; the core has no I8MM |
+| Apple M4 | 63.8 | 29.5 | **2.16×** | blocking only; `smmla` measured slower here |
+| AMD EPYC 7763 (`ubuntu-latest`) | 146.6 | 105.7 | **1.39×** | GEMM tiles only; Zen 3 has no VNNI |
+
+The AVX-512 column is missing because the machine that produced it is gone:
+GitHub's x86 pool served an Intel part with AVX-512 VNNI in the morning and
+an AMD EPYC 7763 by the afternoon. On that Intel runner the same progression
+measured 143.8 → 86.3 (blocking) → **37.2** (tiles), a 3.87× total, and
+`avx2-vnni` did not exist yet. Treat those three numbers as historical.
+
+Two results worth keeping in mind when reading the table:
+
+* **The same change is worth wildly different amounts per core.** Register
+  blocking is 2.16× on an M4 and 2.79× on an M1, but on Neoverse N2 the
+  blocked `sdot` kernel runs at 73.9 against v1's 159.7 — also 2.16×, while
+  on that core the *later* `smmla` kernel is the only thing that moves it
+  further. Meanwhile Zen 3, with no VNNI and no `smmla`, gets nothing from
+  either and keeps only the tile form's 1.39×.
+* **Nothing here changed a score.** Every number in the table is the same
+  checksum, which is what makes measuring at runtime a legitimate way to
+  pick between these paths.
 
 ## Testing
 
