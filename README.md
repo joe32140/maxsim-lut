@@ -103,6 +103,34 @@ broadcast the weights 4 bytes at a time (`vpdpbusd` / `vpmaddubsw`), so no
 horizontal reduction is ever needed. On AVX-512 the query is stored `+128` as
 `u8` and the exact offset `128·Σw` is subtracted once per token.
 
+Measured effect of the two changes over the straightforward one-token,
+one-row-accumulator kernels this crate started from (32 query rows × 240
+tokens, dim 128, nbits 4, ns per scored token, bit-identical results):
+
+| machine | before | register blocking | + GEMM tiles |
+|---|---|---|---|
+| Apple M4 (NEON sdot) | 70.6 | 32.7 | n/a |
+| GitHub `ubuntu-latest` (AVX-512 VNNI) | 143.8 | 86.3 | 37.2 |
+| GitHub `ubuntu-24.04-arm` (NEON sdot) | 159.0 | 73.8 | n/a |
+
+## Real data
+
+`examples/real_index.rs` scores a real next-plaid (≥1.7) index directory
+against a `queries.npy`, with no dependencies (a small NPY reader is inside):
+
+```
+cargo run --release --example real_index -- <index_dir> <queries.npy> [n_queries] [ref_docs]
+```
+
+It reports exhaustive stage-2 time per query and ns/token on the real
+residual codes, parity against float decompression (centroid + bucket weight
+per dim, exact f32 MaxSim), and how loose the exact per-token skip bound
+`max|w| · ‖q‖₁` is on real data. On SciFact / ColBERTv2 (5,183 docs, 1.25M
+tokens, nbits 4) on an M4: 31.9 ns/token on real codes (same as synthetic),
+max |Δscore| 0.0086 with mean relative error 1.5e-4 from the int8 query
+quantisation, and the exact skip bound never fires (mean bound 0.70 against a
+mean residual term of 0.039), so exact token skipping is not a lever here.
+
 ## Provenance and license
 
 The kernels are extracted from next-plaid's `residual_lut.rs`
