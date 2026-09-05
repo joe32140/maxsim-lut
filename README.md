@@ -248,16 +248,31 @@ the last run:
 | `neon-sdot` | Apple M1, Apple M4, Neoverse N2 |
 | `neon-i8mm` | Neoverse N2, Apple M4 |
 | `avx2` | AMD EPYC 7763, Intel Xeon |
-| `avx512-vnni` | Intel Xeon (a runner class no longer in the pool) |
+| `avx512-vnni` | Intel Xeon |
 | `avx2-vnni` | **nothing yet** |
 
-`avx2-vnni` is the one path no machine has run. Its two halves are covered
-separately, which is the argument for shipping it: the 8-row tile addressing
-and masked fold are the AVX2 kernel's, and `vpdpbusd` with the `128·Σw`
-correction is the AVX-512 kernel's, both exercised on real hardware. What is
-untested is the combination and the 256-bit VEX encoding, which is why the
-runtime self-check exists. If you would rather not carry that risk, pin a
-kernel or drop it from the candidate list with `Lut::pin_kernel`.
+`avx2-vnni` is the one path no machine has run, and the reason is structural
+rather than bad luck. It needs a CPU with AVX-VNNI but *without* AVX-512-VNNI,
+which means Alder Lake or later on the client side, or Zen 5. GitHub's pool
+offers AMD Zen 3, which has neither feature, and Intel Xeons that have the
+AVX-512 form and not the VEX one, so on every runner so far dispatch has
+correctly preferred a different kernel. QEMU is not a way out either: its TCG
+backend implements neither extension, so `qemu-x86_64 -cpu max` reports plain
+AVX2 and a pinned run would pass without ever executing the kernel.
+
+Two things make shipping it defensible anyway. Its halves are covered
+separately: the 8-row tile addressing and masked fold are the AVX2 kernel's,
+and `vpdpbusd` with the `128·Σw` correction is the AVX-512 kernel's, both
+exercised on real hardware. And the runtime self-check means the untested
+combination cannot corrupt a score. On the first CPU that does offer AVX-VNNI,
+the kernel is measured against the reference on four shapes before dispatch
+will use it, and a disagreement demotes it rather than shipping wrong numbers.
+If you would still rather not carry it, pin another kernel with
+`Lut::pin_kernel`.
+
+`cargo run --example kernels` prints what the current CPU offers and what
+calibration chose; pass kernel names as arguments to make it exit non-zero
+when one of them is missing.
 
 ## Real data
 

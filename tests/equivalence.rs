@@ -246,6 +246,68 @@ fn pinned_kernels_agree_with_the_calibrated_default() {
     }
 }
 
+/// Empty candidates and empty queries, on every kernel.
+///
+/// Each kernel opens with its own `nq == 0 || n_tokens == 0` early return, so
+/// there are six copies of one guard and no shared code to protect them. Both
+/// shapes are reachable from a host: a filter can empty a candidate, and a
+/// stopword-only query can arrive with no rows. `max` over no document tokens
+/// has no natural value, so the contract is that the whole score is `0.0` and
+/// that nothing is read from the slices.
+#[test]
+fn degenerate_shapes_score_zero_without_reading_anything() {
+    let mut rng = Rng(0x243F6A8885A308D3);
+    let (dim, nbits, ncent) = (128usize, 4usize, 5usize);
+    let p = ColbertPacking::new(nbits).unwrap();
+    let w = weights(nbits, &mut rng);
+    let lut = Lut::new(&p, &w).unwrap();
+
+    // Empty slices, so an out-of-contract read is a panic rather than a
+    // plausible-looking number.
+    let empty_doc = DocView::new(&[], 0, dim / p.keys_per_byte())
+        .codes(Codes::U32(&[]))
+        .inv_norms(&[]);
+    let doc = make_doc(&p, dim, 9, ncent, 0, &mut rng);
+    let full_doc = DocView::new(&doc.packed, doc.ntok, doc.stride)
+        .codes(Codes::U32(&doc.codes))
+        .inv_norms(&doc.inv);
+
+    let mut kernels = vec![None];
+    kernels.extend(supported_kernels().iter().copied().map(Some));
+
+    for pin in kernels {
+        let lut = match pin {
+            Some(k) => lut.clone().pin_kernel(Some(k)),
+            None => lut.clone().force_scalar(true),
+        };
+        let label = lut.kernel(dim);
+
+        // No document tokens, with a normal query.
+        let nq = 32;
+        let query: Vec<f32> = (0..nq * dim).map(|_| rng.f32(-1.0, 1.0)).collect();
+        let q = PreparedQuery::new(&lut, &query, nq, dim).unwrap();
+        let cdot: Vec<f32> = (0..ncent * nq).map(|_| rng.f32(-1.0, 1.0)).collect();
+        let s = Scorer::new(&lut, &q)
+            .with_centroid_term(&cdot, ncent)
+            .unwrap()
+            .score(empty_doc);
+        assert_eq!(s.to_bits(), 0.0f32.to_bits(), "{label}: empty doc scored {s}");
+
+        // No query rows, with a normal document. The centroid term is
+        // [ncent, 0] here, hence the empty slice.
+        let q0 = PreparedQuery::new(&lut, &[], 0, dim).unwrap();
+        let s = Scorer::new(&lut, &q0)
+            .with_centroid_term(&[], ncent)
+            .unwrap()
+            .score(full_doc);
+        assert_eq!(s.to_bits(), 0.0f32.to_bits(), "{label}: empty query scored {s}");
+
+        // Both empty.
+        let s = Scorer::new(&lut, &q0).score(empty_doc);
+        assert_eq!(s.to_bits(), 0.0f32.to_bits(), "{label}: both empty gave {s}");
+    }
+}
+
 /// Randomised shapes rather than a fixed grid: the hand-picked sweep covers
 /// the boundaries someone thought of, which is exactly the set a bug in the
 /// tails is least likely to sit in. Every draw varies the code width, the
