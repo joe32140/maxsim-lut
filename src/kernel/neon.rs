@@ -1,15 +1,28 @@
 //! aarch64 NEON kernel: `tbl` nibble expansion into plane order, `sdot`
-//! accumulation, four-row vectorised epilogue.
+//! accumulation, register-blocked over `NT` document tokens × 4 query rows.
+//!
+//! Blocking is why this beats a per-token loop: with one token at a time every
+//! `sdot` needs two loads (a query chunk and a weight chunk), which caps the
+//! core at ~1.5 `sdot`/cycle on a 3-load/cycle machine. Holding `NT` tokens'
+//! expanded weights and 4 query rows in registers shares each query load
+//! across `NT` products and each weight load across 4 rows: `(4 + NT)` loads
+//! per `4·NT` `sdot`. It also gives the out-of-order core `4·NT` independent
+//! accumulator chains instead of 4. The integer sums are identical to the
+//! unblocked form (same products, exact integer addition), so the result is
+//! bit-identical.
 
 use std::arch::aarch64::*;
 
 use super::Args;
-use crate::lut::Lut;
+use crate::lut::{Lut, NibbleTables};
 use crate::MAX_DIM;
 
-/// `sdot` via inline asm: the intrinsic needs the `dotprod` target feature
-/// on the enclosing function, which we have, but the asm form documents the
-/// exact instruction and pins it independent of intrinsic availability.
+/// Document tokens per register block. 4 × 4 rows = 16 accumulators, well
+/// inside the 32 NEON registers with 4 query and 1 weight chunk live.
+const NT: usize = 4;
+
+/// `sdot` via inline asm: pins the exact instruction independent of intrinsic
+/// availability on the toolchain.
 ///
 /// # Safety
 /// Requires the `dotprod` CPU feature at runtime.
@@ -71,13 +84,151 @@ unsafe fn fold_tail(accs: &[i32], sqw: &[f32], crow: *const f32, inv: f32, best:
     }
 }
 
+/// Expand one token's `pdim` packed bytes into `kpb` planes of int8 weights.
+///
+/// # Safety
+/// `row.len() == pdim`, `kpb · pdim <= MAX_DIM`, tables loaded for `kpb` keys.
+#[inline(always)]
+unsafe fn expand(
+    row: &[u8],
+    tabs: &[int8x16_t; 8],
+    nib: &NibbleTables,
+    kpb: usize,
+    pdim: usize,
+    w: &mut [i8; MAX_DIM],
+) {
+    // SAFETY: stores land in `[k·pdim, k·pdim + 16)` for `i + 16 <= pdim`,
+    // inside the buffer; the tail copies only `rem` valid lanes.
+    unsafe {
+        let low_mask = vdupq_n_u8(0x0F);
+        let wp = w.as_mut_ptr();
+        let mut i = 0usize;
+        while i + 16 <= pdim {
+            let v = vld1q_u8(row.as_ptr().add(i));
+            let hi = vshrq_n_u8(v, 4);
+            let lo = vandq_u8(v, low_mask);
+            for (k, tab) in tabs.iter().enumerate().take(kpb) {
+                let idx = if nib.from_hi[k] { hi } else { lo };
+                vst1q_s8(wp.add(k * pdim + i), vqtbl1q_s8(*tab, idx));
+            }
+            i += 16;
+        }
+        // Sub-16 tail through a zero-padded scratch so the store cannot clobber
+        // the next plane's already-written low bytes. Keeps narrow dims (e.g.
+        // dim 48 at nbits 2 = 12 bytes) on the SIMD path.
+        if i < pdim {
+            let rem = pdim - i;
+            let mut src = [0u8; 16];
+            src[..rem].copy_from_slice(&row[i..pdim]);
+            let v = vld1q_u8(src.as_ptr());
+            let hi = vshrq_n_u8(v, 4);
+            let lo = vandq_u8(v, low_mask);
+            let mut dst = [0i8; 16];
+            for k in 0..kpb {
+                let idx = if nib.from_hi[k] { hi } else { lo };
+                vst1q_s8(dst.as_mut_ptr(), vqtbl1q_s8(tabs[k], idx));
+                w[k * pdim + i..k * pdim + pdim].copy_from_slice(&dst[..rem]);
+            }
+        }
+    }
+}
+
+/// Score `N` expanded tokens against every query row, updating `best`.
+///
+/// # Safety
+/// `dotprod`; `dim % 8 == 0`; query planes zero-padded to a multiple of 16
+/// past `dim` (stride is a multiple of 64); `crows[j]` readable for `nq`
+/// f32s; `best.len() == nq`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn block<const N: usize>(
+    ws: &[[i8; MAX_DIM]; N],
+    dim: usize,
+    nq: usize,
+    qp_base: *const i8,
+    ps: usize,
+    sqw: &[f32],
+    crows: &[*const f32; N],
+    invs: &[f32; N],
+    best: &mut [f32],
+) {
+    // SAFETY: see function contract; every pointer stays inside the query
+    // planes, the expanded buffers (reads of 16 lanes below `dim <= MAX_DIM`)
+    // and the validated centroid rows.
+    unsafe {
+        let mut qi = 0usize;
+        while qi + 4 <= nq {
+            let mut acc = [[vdupq_n_s32(0); 4]; N];
+            let qp = [
+                qp_base.add(qi * ps),
+                qp_base.add((qi + 1) * ps),
+                qp_base.add((qi + 2) * ps),
+                qp_base.add((qi + 3) * ps),
+            ];
+            let mut k = 0usize;
+            while k < dim {
+                let q = [
+                    vld1q_s8(qp[0].add(k)),
+                    vld1q_s8(qp[1].add(k)),
+                    vld1q_s8(qp[2].add(k)),
+                    vld1q_s8(qp[3].add(k)),
+                ];
+                for j in 0..N {
+                    let wv = vld1q_s8(ws[j].as_ptr().add(k));
+                    for r in 0..4 {
+                        acc[j][r] = sdot(acc[j][r], q[r], wv);
+                    }
+                }
+                k += 16;
+            }
+            for j in 0..N {
+                // Pairwise tree -> [Σrow0, Σrow1, Σrow2, Σrow3] in one register.
+                let accv = vpaddq_s32(vpaddq_s32(acc[j][0], acc[j][1]), vpaddq_s32(acc[j][2], acc[j][3]));
+                fold4(accv, qi, sqw, crows[j], invs[j], best);
+            }
+            qi += 4;
+        }
+        if qi < nq {
+            let rem = nq - qi;
+            let mut tail = [0i32; 4];
+            for j in 0..N {
+                for (r, slot) in tail.iter_mut().enumerate().take(rem) {
+                    let qp = qp_base.add((qi + r) * ps);
+                    let mut acc0 = vdupq_n_s32(0);
+                    let mut acc1 = vdupq_n_s32(0);
+                    let mut k = 0usize;
+                    while k < dim {
+                        acc0 = sdot(acc0, vld1q_s8(qp.add(k)), vld1q_s8(ws[j].as_ptr().add(k)));
+                        if k + 16 < dim {
+                            acc1 = sdot(
+                                acc1,
+                                vld1q_s8(qp.add(k + 16)),
+                                vld1q_s8(ws[j].as_ptr().add(k + 16)),
+                            );
+                        }
+                        k += 32;
+                    }
+                    *slot = vaddvq_s32(vaddq_s32(acc0, acc1));
+                }
+                fold_tail(
+                    &tail[..rem],
+                    &sqw[qi..],
+                    crows[j].add(qi),
+                    invs[j],
+                    &mut best[qi..],
+                );
+            }
+        }
+    }
+}
+
 /// # Safety
 /// Requires `dotprod`; `dim % 8 == 0 && dim <= MAX_DIM`; nibble tables
 /// present; query plane stride `>= padded_stride(dim)` (the dot loop reads
 /// 16-byte chunks past `dim` into zero padding); every slice in `args`
 /// validated by the scorer.
 #[target_feature(enable = "dotprod")]
-pub(super) unsafe fn maxsim(lut: &Lut, a: &Args<'_>, best: &mut Vec<f32>, accs: &mut Vec<i32>) -> f32 {
+pub(super) unsafe fn maxsim(lut: &Lut, a: &Args<'_>, best: &mut Vec<f32>, _accs: &mut Vec<i32>) -> f32 {
     let q = a.query;
     let nq = q.n_tokens();
     let dim = q.dim();
@@ -92,93 +243,49 @@ pub(super) unsafe fn maxsim(lut: &Lut, a: &Args<'_>, best: &mut Vec<f32>, accs: 
     let sqw = q.sqw();
     best.clear();
     best.resize(nq, f32::NEG_INFINITY);
-    accs.clear();
-    accs.resize(nq, 0);
-    let mut w = [0i8; MAX_DIM];
 
-    // SAFETY: all pointer arithmetic below stays within slices the scorer
-    // validated, the `[i8; MAX_DIM]` buffer (dim <= 256, chunks <= 32 lanes
-    // past a multiple-of-32 offset below dim), and the zero-padded query
-    // planes (stride is a multiple of 64).
+    // SAFETY: preconditions above; `expand`/`block` contracts hold for every
+    // token because the scorer validated `packed`, `codes`, `inv_norms`.
     unsafe {
         let mut tabs = [vdupq_n_s8(0); 8];
         for (tab, src) in tabs.iter_mut().zip(nib.tables.iter()).take(kpb) {
             *tab = vld1q_s8(src.as_ptr());
         }
-        let low_mask = vdupq_n_u8(0x0F);
-
-        for t in 0..a.n_tokens {
-            let row = &a.packed[t * a.row_stride..t * a.row_stride + pdim];
-            let wp = w.as_mut_ptr();
-            let mut i = 0usize;
-            while i + 16 <= pdim {
-                let v = vld1q_u8(row.as_ptr().add(i));
-                let hi = vshrq_n_u8(v, 4);
-                let lo = vandq_u8(v, low_mask);
-                for (k, tab) in tabs.iter().enumerate().take(kpb) {
-                    let idx = if nib.from_hi[k] { hi } else { lo };
-                    vst1q_s8(wp.add(k * pdim + i), vqtbl1q_s8(*tab, idx));
-                }
-                i += 16;
+        let mut ws = [[0i8; MAX_DIM]; NT];
+        let mut crows = [std::ptr::null::<f32>(); NT];
+        let mut invs = [0f32; NT];
+        let mut t = 0usize;
+        while t + NT <= a.n_tokens {
+            for j in 0..NT {
+                let tt = t + j;
+                expand(
+                    &a.packed[tt * a.row_stride..tt * a.row_stride + pdim],
+                    &tabs,
+                    nib,
+                    kpb,
+                    pdim,
+                    &mut ws[j],
+                );
+                crows[j] = a.crow(tt);
+                invs[j] = a.inv(tt);
             }
-            // Sub-16 tail: expand through a zero-padded 16-byte scratch and
-            // copy out only the valid lanes, so the store cannot clobber the
-            // next plane's already-written low bytes. Keeps narrow dims
-            // (e.g. dim 48 at nbits 2 = 12 bytes) on the SIMD path.
-            if i < pdim {
-                let rem = pdim - i;
-                let mut src = [0u8; 16];
-                src[..rem].copy_from_slice(&row[i..pdim]);
-                let v = vld1q_u8(src.as_ptr());
-                let hi = vshrq_n_u8(v, 4);
-                let lo = vandq_u8(v, low_mask);
-                let mut dst = [0i8; 16];
-                for k in 0..kpb {
-                    let idx = if nib.from_hi[k] { hi } else { lo };
-                    vst1q_s8(dst.as_mut_ptr(), vqtbl1q_s8(tabs[k], idx));
-                    w[k * pdim + i..k * pdim + pdim].copy_from_slice(&dst[..rem]);
-                }
-            }
-            let wp = w.as_ptr();
-            let inv = a.inv(t);
-            let crow = a.crow(t);
-
-            // Per-row SDOT over the shared expanded weights, two independent
-            // accumulators. Partial tail chunks are exact: both sides zero-pad.
-            macro_rules! row_acc {
-                ($qi:expr) => {{
-                    let qp = qp_base.add($qi * ps);
-                    let mut acc0 = vdupq_n_s32(0);
-                    let mut acc1 = vdupq_n_s32(0);
-                    let mut k = 0usize;
-                    while k < dim {
-                        acc0 = sdot(acc0, vld1q_s8(qp.add(k)), vld1q_s8(wp.add(k)));
-                        if k + 16 < dim {
-                            acc1 = sdot(acc1, vld1q_s8(qp.add(k + 16)), vld1q_s8(wp.add(k + 16)));
-                        }
-                        k += 32;
-                    }
-                    vaddq_s32(acc0, acc1)
-                }};
-            }
-            let mut qi = 0usize;
-            while qi + 4 <= nq {
-                let v0 = row_acc!(qi);
-                let v1 = row_acc!(qi + 1);
-                let v2 = row_acc!(qi + 2);
-                let v3 = row_acc!(qi + 3);
-                // Pairwise tree -> [Σv0, Σv1, Σv2, Σv3] in one register.
-                let accv = vpaddq_s32(vpaddq_s32(v0, v1), vpaddq_s32(v2, v3));
-                fold4(accv, qi, sqw, crow, inv, best);
-                qi += 4;
-            }
-            if qi < nq {
-                let rem = nq - qi;
-                for (r, acc) in accs.iter_mut().enumerate().take(rem) {
-                    *acc = vaddvq_s32(row_acc!(qi + r));
-                }
-                fold_tail(&accs[..rem], &sqw[qi..], crow.add(qi), inv, &mut best[qi..]);
-            }
+            block::<NT>(&ws, dim, nq, qp_base, ps, sqw, &crows, &invs, best);
+            t += NT;
+        }
+        while t < a.n_tokens {
+            expand(
+                &a.packed[t * a.row_stride..t * a.row_stride + pdim],
+                &tabs,
+                nib,
+                kpb,
+                pdim,
+                &mut ws[0],
+            );
+            let one_w = [ws[0]];
+            let one_c = [a.crow(t)];
+            let one_i = [a.inv(t)];
+            block::<1>(&one_w, dim, nq, qp_base, ps, sqw, &one_c, &one_i, best);
+            t += 1;
         }
     }
     best.iter().sum()

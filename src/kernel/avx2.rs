@@ -1,5 +1,6 @@
-//! x86_64 AVX2 kernel: `pshufb` nibble expansion into plane order,
-//! `maddubs`/`madd` accumulation, eight-row vectorised epilogue.
+//! x86_64 AVX2 kernel, register-blocked over `NT` document tokens × 4 query
+//! rows (see `neon.rs` for why blocking pays). AVX2 has 16 ymm registers, so
+//! the block is 2 tokens: 8 accumulators + 4 query + weight-side temporaries.
 //!
 //! Exactness: both operands are clamped to ±127 at quantisation, so
 //! `_mm256_sign_epi8` never sees −128 and each `maddubs` pair-sum is bounded
@@ -8,8 +9,11 @@
 use std::arch::x86_64::*;
 
 use super::Args;
-use crate::lut::Lut;
+use crate::lut::{Lut, NibbleTables};
 use crate::MAX_DIM;
+
+/// Tokens per register block (see module docs).
+const NT: usize = 2;
 
 /// Eight-row fold; same ops, same order as the scalar tail, hence bit-identical
 /// (`_mm256_cvtepi32_ps` rounds to nearest like `as f32`; separate mul/add;
@@ -47,6 +51,149 @@ unsafe fn fold_block(accs: &[i32], sqw: &[f32], crow: *const f32, inv: f32, best
     }
 }
 
+/// Expand one token's `pdim` packed bytes into `kpb` planes of int8 weights.
+///
+/// # Safety
+/// `row.len() == pdim`, `kpb · pdim <= MAX_DIM`, tables loaded for `kpb` keys.
+#[inline(always)]
+unsafe fn expand(
+    row: &[u8],
+    tabs: &[__m128i; 8],
+    nib: &NibbleTables,
+    kpb: usize,
+    pdim: usize,
+    w: &mut [i8; MAX_DIM],
+) {
+    // SAFETY: stores land in `[k·pdim, k·pdim + 16)` for `i + 16 <= pdim`;
+    // the tail copies only `rem` valid lanes.
+    unsafe {
+        let low_mask = _mm_set1_epi8(0x0F);
+        let wp = w.as_mut_ptr();
+        let mut i = 0usize;
+        while i + 16 <= pdim {
+            let v = _mm_loadu_si128(row.as_ptr().add(i) as *const __m128i);
+            let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
+            let lo = _mm_and_si128(v, low_mask);
+            for (k, tab) in tabs.iter().enumerate().take(kpb) {
+                let idx = if nib.from_hi[k] { hi } else { lo };
+                _mm_storeu_si128(wp.add(k * pdim + i) as *mut __m128i, _mm_shuffle_epi8(*tab, idx));
+            }
+            i += 16;
+        }
+        if i < pdim {
+            let rem = pdim - i;
+            let mut src = [0u8; 16];
+            src[..rem].copy_from_slice(&row[i..pdim]);
+            let v = _mm_loadu_si128(src.as_ptr() as *const __m128i);
+            let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
+            let lo = _mm_and_si128(v, low_mask);
+            let mut dst = [0i8; 16];
+            for k in 0..kpb {
+                let idx = if nib.from_hi[k] { hi } else { lo };
+                _mm_storeu_si128(dst.as_mut_ptr() as *mut __m128i, _mm_shuffle_epi8(tabs[k], idx));
+                w[k * pdim + i..k * pdim + pdim].copy_from_slice(&dst[..rem]);
+            }
+        }
+    }
+}
+
+/// Horizontal sum of eight i32 lanes.
+///
+/// # Safety
+/// AVX2.
+#[inline(always)]
+unsafe fn hsum(acc: __m256i) -> i32 {
+    // SAFETY: register-only ops.
+    unsafe {
+        let hi128 = _mm256_extracti128_si256(acc, 1);
+        let s128 = _mm_add_epi32(_mm256_castsi256_si128(acc), hi128);
+        let s64 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
+        let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
+        _mm_cvtsi128_si32(s32)
+    }
+}
+
+/// Integer accumulators for `N` expanded tokens × all `nq` rows into
+/// `accs[j·nq + qi]`, then fold each token.
+///
+/// # Safety
+/// AVX2; `dim % 8 == 0`; query planes zero-padded to a multiple of 32 past
+/// `dim`; `crows[j]` readable for `nq` f32s; `accs.len() >= N·nq`;
+/// `best.len() == nq`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn block<const N: usize>(
+    ws: &[[i8; MAX_DIM]; N],
+    dim: usize,
+    nq: usize,
+    qp_base: *const i8,
+    ps: usize,
+    sqw: &[f32],
+    crows: &[*const f32; N],
+    invs: &[f32; N],
+    accs: &mut [i32],
+    best: &mut [f32],
+) {
+    // SAFETY: see function contract; 32-lane reads below a multiple-of-32
+    // bound <= 256 stay inside the expanded buffers and padded planes.
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut qi = 0usize;
+        while qi + 4 <= nq {
+            let mut acc = [[_mm256_setzero_si256(); 4]; N];
+            let qp = [
+                qp_base.add(qi * ps),
+                qp_base.add((qi + 1) * ps),
+                qp_base.add((qi + 2) * ps),
+                qp_base.add((qi + 3) * ps),
+            ];
+            let mut k = 0usize;
+            while k < dim {
+                let q = [
+                    _mm256_loadu_si256(qp[0].add(k) as *const __m256i),
+                    _mm256_loadu_si256(qp[1].add(k) as *const __m256i),
+                    _mm256_loadu_si256(qp[2].add(k) as *const __m256i),
+                    _mm256_loadu_si256(qp[3].add(k) as *const __m256i),
+                ];
+                for j in 0..N {
+                    let wv = _mm256_loadu_si256(ws[j].as_ptr().add(k) as *const __m256i);
+                    let mag = _mm256_abs_epi8(wv);
+                    for r in 0..4 {
+                        let prod = _mm256_maddubs_epi16(mag, _mm256_sign_epi8(q[r], wv));
+                        acc[j][r] = _mm256_add_epi32(acc[j][r], _mm256_madd_epi16(prod, ones));
+                    }
+                }
+                k += 32;
+            }
+            for j in 0..N {
+                for r in 0..4 {
+                    accs[j * nq + qi + r] = hsum(acc[j][r]);
+                }
+            }
+            qi += 4;
+        }
+        while qi < nq {
+            let qp = qp_base.add(qi * ps);
+            for j in 0..N {
+                let mut acc = _mm256_setzero_si256();
+                let mut k = 0usize;
+                while k < dim {
+                    let qv = _mm256_loadu_si256(qp.add(k) as *const __m256i);
+                    let wv = _mm256_loadu_si256(ws[j].as_ptr().add(k) as *const __m256i);
+                    let prod = _mm256_maddubs_epi16(_mm256_abs_epi8(wv), _mm256_sign_epi8(qv, wv));
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(prod, ones));
+                    k += 32;
+                }
+                accs[j * nq + qi] = hsum(acc);
+            }
+            qi += 1;
+        }
+        for j in 0..N {
+            fold_block(&accs[j * nq..(j + 1) * nq], sqw, crows[j], invs[j], best);
+        }
+    }
+}
+
 /// # Safety
 /// Requires AVX2; `dim % 8 == 0 && dim <= MAX_DIM`; nibble tables present;
 /// query plane stride `>= padded_stride(dim)` (32-byte chunks read past
@@ -68,67 +215,50 @@ pub(super) unsafe fn maxsim(lut: &Lut, a: &Args<'_>, best: &mut Vec<f32>, accs: 
     best.clear();
     best.resize(nq, f32::NEG_INFINITY);
     accs.clear();
-    accs.resize(nq, 0);
-    let mut w = [0i8; MAX_DIM];
+    accs.resize(NT * nq, 0);
 
-    // SAFETY: pointer arithmetic stays within validated slices, the
-    // `[i8; MAX_DIM]` buffer (32-lane chunks below a multiple-of-32 bound
-    // <= 256) and the zero-padded query planes (stride multiple of 64).
+    // SAFETY: preconditions above; `expand`/`block` contracts hold for every
+    // token because the scorer validated `packed`, `codes`, `inv_norms`.
     unsafe {
         let mut tabs = [_mm_setzero_si128(); 8];
         for (tab, src) in tabs.iter_mut().zip(nib.tables.iter()).take(kpb) {
             *tab = _mm_loadu_si128(src.as_ptr() as *const __m128i);
         }
-        let low_mask = _mm_set1_epi8(0x0F);
-        let ones = _mm256_set1_epi16(1);
-
-        for t in 0..a.n_tokens {
-            let row = &a.packed[t * a.row_stride..t * a.row_stride + pdim];
-            let wp = w.as_mut_ptr();
-            let mut i = 0usize;
-            while i + 16 <= pdim {
-                let v = _mm_loadu_si128(row.as_ptr().add(i) as *const __m128i);
-                let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
-                let lo = _mm_and_si128(v, low_mask);
-                for (k, tab) in tabs.iter().enumerate().take(kpb) {
-                    let idx = if nib.from_hi[k] { hi } else { lo };
-                    _mm_storeu_si128(wp.add(k * pdim + i) as *mut __m128i, _mm_shuffle_epi8(*tab, idx));
-                }
-                i += 16;
+        let mut ws = [[0i8; MAX_DIM]; NT];
+        let mut crows = [std::ptr::null::<f32>(); NT];
+        let mut invs = [0f32; NT];
+        let mut t = 0usize;
+        while t + NT <= a.n_tokens {
+            for j in 0..NT {
+                let tt = t + j;
+                expand(
+                    &a.packed[tt * a.row_stride..tt * a.row_stride + pdim],
+                    &tabs,
+                    nib,
+                    kpb,
+                    pdim,
+                    &mut ws[j],
+                );
+                crows[j] = a.crow(tt);
+                invs[j] = a.inv(tt);
             }
-            if i < pdim {
-                let rem = pdim - i;
-                let mut src = [0u8; 16];
-                src[..rem].copy_from_slice(&row[i..pdim]);
-                let v = _mm_loadu_si128(src.as_ptr() as *const __m128i);
-                let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
-                let lo = _mm_and_si128(v, low_mask);
-                let mut dst = [0i8; 16];
-                for k in 0..kpb {
-                    let idx = if nib.from_hi[k] { hi } else { lo };
-                    _mm_storeu_si128(dst.as_mut_ptr() as *mut __m128i, _mm_shuffle_epi8(tabs[k], idx));
-                    w[k * pdim + i..k * pdim + pdim].copy_from_slice(&dst[..rem]);
-                }
-            }
-            let wp = w.as_ptr();
-            for (qi, acc_qi) in accs.iter_mut().enumerate() {
-                let qp = qp_base.add(qi * ps);
-                let mut acc = _mm256_setzero_si256();
-                let mut k = 0usize;
-                while k < dim {
-                    let qv = _mm256_loadu_si256(qp.add(k) as *const __m256i);
-                    let wv = _mm256_loadu_si256(wp.add(k) as *const __m256i);
-                    let prod = _mm256_maddubs_epi16(_mm256_abs_epi8(wv), _mm256_sign_epi8(qv, wv));
-                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(prod, ones));
-                    k += 32;
-                }
-                let hi128 = _mm256_extracti128_si256(acc, 1);
-                let s128 = _mm_add_epi32(_mm256_castsi256_si128(acc), hi128);
-                let s64 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
-                let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
-                *acc_qi = _mm_cvtsi128_si32(s32);
-            }
-            fold_block(accs, sqw, a.crow(t), a.inv(t), best);
+            block::<NT>(&ws, dim, nq, qp_base, ps, sqw, &crows, &invs, accs, best);
+            t += NT;
+        }
+        while t < a.n_tokens {
+            expand(
+                &a.packed[t * a.row_stride..t * a.row_stride + pdim],
+                &tabs,
+                nib,
+                kpb,
+                pdim,
+                &mut ws[0],
+            );
+            let one_w = [ws[0]];
+            let one_c = [a.crow(t)];
+            let one_i = [a.inv(t)];
+            block::<1>(&one_w, dim, nq, qp_base, ps, sqw, &one_c, &one_i, accs, best);
+            t += 1;
         }
     }
     best.iter().sum()
