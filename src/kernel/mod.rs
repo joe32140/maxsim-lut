@@ -180,19 +180,82 @@ fn env_no_calibrate() -> bool {
     })
 }
 
+/// A synthetic index and query the calibrator can score, owning its buffers.
+struct Probe {
+    lut: Lut,
+    query: PreparedQuery,
+    packed: Vec<u8>,
+    inv: Vec<f32>,
+    row_stride: usize,
+    n_tokens: usize,
+}
+
+impl Probe {
+    /// `None` only if the shape is invalid, which the call sites' constants
+    /// rule out; it keeps calibration total without a panic.
+    fn new(nbits: usize, dim: usize, nq: usize, n_tokens: usize) -> Option<Self> {
+        let n = 1usize << nbits;
+        let weights: Vec<f32> = (0..n)
+            .map(|i| -0.35 + 0.7 * (i as f32 + 0.5) / n as f32)
+            .collect();
+        let lut = Lut::colbert(nbits, &weights).ok()?;
+        // Deterministic pseudo-random content. The kernels never branch on
+        // values, so any well-mixed data times the same and exercises the
+        // same paths.
+        let q: Vec<f32> = (0..nq * dim)
+            .map(|i| ((i * 37 % 251) as f32 / 251.0) - 0.5)
+            .collect();
+        let query = PreparedQuery::new(&lut, &q, nq, dim).ok()?;
+        let row_stride = dim / lut.keys_per_byte();
+        Some(Self {
+            packed: (0..n_tokens * row_stride).map(|i| (i * 97 % 256) as u8).collect(),
+            inv: (0..n_tokens).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect(),
+            lut,
+            query,
+            row_stride,
+            n_tokens,
+        })
+    }
+
+    fn args(&self) -> Args<'_> {
+        Args {
+            query: &self.query,
+            packed: &self.packed,
+            row_stride: self.row_stride,
+            n_tokens: self.n_tokens,
+            codes: Codes::None,
+            cdot: self.query.zeros(),
+            cdot_stride: 0,
+            inv_norms: Some(&self.inv),
+        }
+    }
+}
+
+/// Shapes the self-check scores. The first is the ColBERT working point and
+/// is also the one timed; the rest exist to reach the paths a single shape
+/// would miss: an odd query-row count (masked fold tails), a `dim` whose
+/// packed row ends mid-vector (the expansion tail), a row count just past a
+/// block boundary, and each supported code width.
+const PROBE_SHAPES: [(usize, usize, usize, usize); 4] = [
+    // (nbits, dim, n_query_rows, n_doc_tokens)
+    (4, 128, 32, 64),
+    (4, 40, 9, 5),
+    (2, 96, 17, 7),
+    (1, 256, 1, 3),
+];
+
 /// The fastest *verified* kernel for this CPU, decided once per process.
 ///
-/// The probe shape (32 query rows × 64 document tokens, dim 128, nbits 4) is
-/// the ColBERT working point. Each candidate is first checked against the
-/// scalar reference on that probe and dropped if it disagrees, then the
-/// survivors are timed with their arms interleaved and reduced by minimum,
-/// so a scheduling hiccup has to hit every repetition of one arm to change
-/// the verdict.
+/// Each candidate is scored against the scalar reference on every
+/// [`PROBE_SHAPES`] entry and dropped if it disagrees anywhere; the
+/// survivors are then timed on the first shape with their arms interleaved
+/// and reduced by minimum, so a scheduling hiccup has to hit every
+/// repetition of one arm to change the verdict.
 ///
-/// The check matters for a kernel whose instruction this build's CI has no
-/// hardware for: it cannot be shipped on the strength of a compile alone, so
-/// it proves itself on the host before dispatch will use it. It costs one
-/// extra scalar scoring of the probe, once.
+/// The check exists because CI cannot own every microarchitecture this crate
+/// emits code for: a kernel whose instruction no test machine has must prove
+/// itself on the host before dispatch will use it. It is a smoke test rather
+/// than a proof, which is why it spans several shapes instead of one.
 fn calibrated() -> Kernel {
     static CHOICE: OnceLock<Kernel> = OnceLock::new();
     *CHOICE.get_or_init(|| {
@@ -205,62 +268,51 @@ fn calibrated() -> Kernel {
     })
 }
 
-/// Verify each candidate against the scalar reference on a synthetic
-/// document, then time the survivors.
-///
-/// `fallback` is returned unmeasured if the probe cannot be built, which the
-/// constants below make impossible but which keeps dispatch total without a
-/// panic. If the probe builds and *no* candidate reproduces the reference,
-/// the result is `Scalar(SelfCheckFailed)`: a wrong fast answer is worse
-/// than a slow right one.
-fn measure_fastest(cands: &[Kernel], fallback: Kernel) -> Kernel {
-    const DIM: usize = 128;
-    const NQ: usize = 32;
-    const NTOK: usize = 64;
-    const REPS: usize = 5;
-    const ITERS: usize = 8;
-
-    let weights: Vec<f32> = (0..16).map(|i| -0.35 + 0.05 * i as f32).collect();
-    let Ok(lut) = Lut::colbert(4, &weights) else {
-        return fallback;
-    };
-    // Deterministic pseudo-random inputs: the kernels are data-independent
-    // (no branches on values), so any well-mixed content times the same.
-    let query: Vec<f32> = (0..NQ * DIM)
-        .map(|i| ((i * 37 % 251) as f32 / 251.0) - 0.5)
-        .collect();
-    let Ok(q) = PreparedQuery::new(&lut, &query, NQ, DIM) else {
-        return fallback;
-    };
-    let pdim = DIM / lut.keys_per_byte();
-    let packed: Vec<u8> = (0..NTOK * pdim).map(|i| (i * 97 % 256) as u8).collect();
-    let inv: Vec<f32> = (0..NTOK).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect();
-    let args = Args {
-        query: &q,
-        packed: &packed,
-        row_stride: pdim,
-        n_tokens: NTOK,
-        codes: Codes::None,
-        cdot: q.zeros(),
-        cdot_stride: 0,
-        inv_norms: Some(&inv),
-    };
-
-    // Self-check: a kernel that does not reproduce the reference bit for bit
-    // on this CPU is not a candidate, however fast it is.
-    let want = scalar(&lut, &args).to_bits();
-    let verified: Vec<Kernel> = cands
+/// Candidates that reproduce the scalar reference bit for bit on every
+/// probe. `score` is the kernel runner, taken as an argument so tests can
+/// substitute one that lies.
+fn verified_kernels<F>(cands: &[Kernel], probes: &[Probe], mut score: F) -> Vec<Kernel>
+where
+    F: FnMut(Kernel, &Lut, &Args<'_>) -> f32,
+{
+    cands
         .iter()
         .copied()
         .filter(|&k| {
-            let ok = run(k, &lut, &args).to_bits() == want;
-            debug_assert!(
-                ok,
-                "{k} disagreed with the scalar reference on the calibration probe"
-            );
-            ok
+            probes.iter().all(|p| {
+                let args = p.args();
+                score(k, &p.lut, &args).to_bits() == scalar(&p.lut, &args).to_bits()
+            })
         })
-        .collect();
+        .collect()
+}
+
+/// Verify the candidates, then time the survivors on the production shape.
+///
+/// `fallback` is returned unmeasured if the probes cannot be built. If they
+/// build and *no* candidate reproduces the reference, the result is
+/// `Scalar(SelfCheckFailed)`: a wrong fast answer is worse than a slow right
+/// one.
+fn measure_fastest(cands: &[Kernel], fallback: Kernel) -> Kernel {
+    const REPS: usize = 5;
+    const ITERS: usize = 8;
+
+    let mut probes = Vec::with_capacity(PROBE_SHAPES.len());
+    for (nbits, dim, nq, ntok) in PROBE_SHAPES {
+        match Probe::new(nbits, dim, nq, ntok) {
+            Some(p) => probes.push(p),
+            None => return fallback,
+        }
+    }
+
+    let verified = verified_kernels(cands, &probes, run);
+    // A candidate this CPU claims to support and cannot reproduce is a bug in
+    // this crate or a lying CPU; be loud about it where asserts are on.
+    debug_assert_eq!(
+        verified.len(),
+        cands.len(),
+        "a supported kernel disagreed with the scalar reference: kept {verified:?} of {cands:?}"
+    );
     let Some((&first, rest)) = verified.split_first() else {
         return Kernel::Scalar(ScalarReason::SelfCheckFailed);
     };
@@ -268,12 +320,14 @@ fn measure_fastest(cands: &[Kernel], fallback: Kernel) -> Kernel {
         return first;
     }
 
+    let timed = &probes[0];
+    let args = timed.args();
     let mut best = vec![f64::INFINITY; verified.len()];
     for _ in 0..REPS {
         for (slot, &k) in best.iter_mut().zip(&verified) {
             let t = Instant::now();
             for _ in 0..ITERS {
-                black_box(run(k, &lut, &args));
+                black_box(run(k, &timed.lut, &args));
             }
             *slot = slot.min(t.elapsed().as_secs_f64());
         }
@@ -477,6 +531,44 @@ mod tests {
         }
     }
 
+    /// The self-check is the only thing standing between an unproven kernel
+    /// and wrong scores, so prove it actually rejects one. A truthful runner
+    /// keeps every candidate; one that corrupts a single kernel's result
+    /// drops exactly that kernel; one that corrupts all of them leaves
+    /// nothing, which is what makes dispatch fall back to the reference.
+    #[test]
+    fn the_self_check_rejects_a_kernel_that_disagrees() {
+        let cands = cpu_kernels();
+        if cands.is_empty() {
+            return; // no SIMD on this target; nothing to verify
+        }
+        let probes: Vec<Probe> = PROBE_SHAPES
+            .iter()
+            .map(|&(nbits, dim, nq, ntok)| Probe::new(nbits, dim, nq, ntok).expect("probe shapes are valid"))
+            .collect();
+
+        assert_eq!(
+            verified_kernels(cands, &probes, run),
+            cands.to_vec(),
+            "the real kernels must all verify on this CPU"
+        );
+
+        let liar = cands[cands.len() - 1];
+        let kept = verified_kernels(cands, &probes, |k, lut, args| {
+            let s = run(k, lut, args);
+            if k == liar {
+                s + 1.0
+            } else {
+                s
+            }
+        });
+        assert!(!kept.contains(&liar), "{liar} lied and was still accepted");
+        assert_eq!(kept.len(), cands.len() - 1, "only the liar should be dropped");
+
+        let none = verified_kernels(cands, &probes, |_, _, _| f32::NAN);
+        assert!(none.is_empty(), "every kernel lied but {none:?} survived");
+    }
+
     /// Calibration only ever returns something dispatch may legally run: a
     /// kernel this CPU supports, or the scalar reference if none verified.
     #[test]
@@ -500,7 +592,16 @@ mod tests {
     #[test]
     fn every_supported_kernel_matches_scalar_bitwise() {
         let kernels = kernels_under_test();
-        let mut rng = Rng(0x452821E638D01377);
+        // Several independent draws per shape: one seed proves a shape works
+        // for one arrangement of bytes, not that the fold and the tails are
+        // right for the values that land near their boundaries.
+        for seed in [0x452821E638D01377u64, 0x13198A2E03707344, 0xBE5466CF34E90C6C] {
+            check_shapes(&kernels, Rng(seed));
+        }
+        eprintln!("kernels exercised: {kernels:?}");
+    }
+
+    fn check_shapes(kernels: &[Kernel], mut rng: Rng) {
         for &nq in &[1usize, 3, 7, 8, 9, 16, 17, 32] {
             for &nbits in &[1usize, 2, 4] {
                 for &dim in &[8usize, 16, 40, 48, 96, 128, 200, 256] {
@@ -536,7 +637,7 @@ mod tests {
                                 inv_norms: if with_inv { Some(&inv) } else { None },
                             };
                             let want = scalar(&lut, &args);
-                            for &k in &kernels {
+                            for &k in kernels {
                                 let got = run(k, &lut, &args);
                                 assert_eq!(
                                     got.to_bits(),
@@ -549,6 +650,5 @@ mod tests {
                 }
             }
         }
-        eprintln!("kernels exercised: {:?}", kernels);
     }
 }

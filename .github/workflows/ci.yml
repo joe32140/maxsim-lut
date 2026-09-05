@@ -51,8 +51,14 @@ jobs:
       - run: cargo check --target wasm32-unknown-unknown
 
   msrv:
-    name: msrv (1.89)
-    runs-on: ubuntu-latest
+    # Both architectures: the NEON and x86 kernels use different intrinsics
+    # and inline asm, so one architecture's MSRV says nothing about the other.
+    name: msrv 1.89 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89

@@ -112,8 +112,26 @@ fn reference(
 
 #[test]
 fn simd_matches_scalar_bitwise_across_shapes() {
-    let mut rng = Rng(0x243F6A8885A308D3);
+    // Three independent draws per shape; one is a single arrangement of
+    // bytes, not evidence that the tails hold for the values near them.
     let mut simd_seen = false;
+    for seed in [0x243F6A8885A308D3u64, 0x452821E638D01377, 0xC0AC29B7C97C50DD] {
+        sweep_shapes(Rng(seed), &mut simd_seen);
+    }
+    // On any machine with SIMD, the test must have exercised it; otherwise
+    // the bit-equality above compared scalar with scalar.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    {
+        let expect_simd = Lut::colbert(4, &[0.0; 16]).unwrap().kernel(128).is_simd();
+        assert_eq!(
+            simd_seen, expect_simd,
+            "SIMD dispatch state did not match Lut::kernel"
+        );
+    }
+    let _ = simd_seen;
+}
+
+fn sweep_shapes(mut rng: Rng, simd_seen: &mut bool) {
     // nq values exercise every fold branch: 1,3 pure tail; 7 one NEON block +
     // tail; 8 one AVX2 block; 9 block + 1-lane tail; 16 one AVX-512 block;
     // 32 the production shape.
@@ -147,7 +165,7 @@ fn simd_matches_scalar_bitwise_across_shapes() {
                         "nq={nq} nbits={nbits} dim={dim} extra={extra}: {} gave {fast}, scalar gave {slow}",
                         lut.kernel(dim)
                     );
-                    simd_seen |= lut.kernel(dim).is_simd();
+                    *simd_seen |= lut.kernel(dim).is_simd();
                     let want = reference(&lut, &q, &w, &doc, Some((&cdot, ncent)), true);
                     assert!(
                         (fast as f64 - want).abs() < 1e-3 * (1.0 + want.abs()),
@@ -157,17 +175,6 @@ fn simd_matches_scalar_bitwise_across_shapes() {
             }
         }
     }
-    // On any machine with SIMD, the test must have exercised it; otherwise
-    // the bit-equality above compared scalar with scalar.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    {
-        let expect_simd = Lut::colbert(4, &[0.0; 16]).unwrap().kernel(128).is_simd();
-        assert_eq!(
-            simd_seen, expect_simd,
-            "SIMD dispatch state did not match Lut::kernel"
-        );
-    }
-    let _ = simd_seen;
 }
 
 /// Every kernel the CPU can run scores identically through the public

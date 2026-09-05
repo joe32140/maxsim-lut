@@ -201,11 +201,44 @@ MAXSIM_LUT_FORCE_SCALAR=1 cargo test
 
 Two tests pin the bit-exactness contract across every kernel the CPU can
 execute, not just the one dispatch picks: the unit test
-`every_supported_kernel_matches_scalar_bitwise` over a shape sweep, and the
-integration test `pinned_kernels_agree_with_the_calibrated_default` through
-the public pinning API. So an AVX-512 machine still verifies AVX2, and a
-Neoverse core verifies both NEON kernels. CI runs x86_64 and aarch64 runners
-plus a `cargo check` for a target with no SIMD path.
+`every_supported_kernel_matches_scalar_bitwise` over a shape sweep (`nq` 1–32
+× `nbits` 1/2/4 × `dim` 8–256 × with and without each optional term, three
+independent random draws each), and the integration test
+`pinned_kernels_agree_with_the_calibrated_default` through the public pinning
+API. So an AVX-512 machine still verifies AVX2, and a Neoverse core verifies
+both NEON kernels.
+
+`tests/concurrency.rs` is a separate binary, so its threads race for the
+first dispatch in a cold process: it checks that concurrent scoring is
+bit-identical to a single-threaded run, that every thread resolves
+calibration to the same kernel, and that the public types are `Send + Sync`.
+`the_self_check_rejects_a_kernel_that_disagrees` feeds calibration a runner
+that lies about one kernel and asserts that exactly that kernel is dropped,
+because an untested safety net is not a safety net.
+
+CI runs x86_64 and aarch64 runners, a `cargo check` for a target with no SIMD
+path, and the MSRV on both architectures.
+
+### What has actually run on silicon
+
+CI can only test the machines it is given, and GitHub's pool changes. As of
+the last run:
+
+| kernel | executed on |
+|---|---|
+| `neon-sdot` | Apple M1, Apple M4, Neoverse N2 |
+| `neon-i8mm` | Neoverse N2, Apple M4 |
+| `avx2` | AMD EPYC 7763, Intel Xeon |
+| `avx512-vnni` | Intel Xeon (a runner class no longer in the pool) |
+| `avx2-vnni` | **nothing yet** |
+
+`avx2-vnni` is the one path no machine has run. Its two halves are covered
+separately, which is the argument for shipping it: the 8-row tile addressing
+and masked fold are the AVX2 kernel's, and `vpdpbusd` with the `128·Σw`
+correction is the AVX-512 kernel's, both exercised on real hardware. What is
+untested is the combination and the 256-bit VEX encoding, which is why the
+runtime self-check exists. If you would rather not carry that risk, pin a
+kernel or drop it from the candidate list with `Lut::pin_kernel`.
 
 ## Real data
 
